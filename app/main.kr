@@ -1,0 +1,6 @@
+// KR Unified module manifest for AURA Workspace Enterprise.
+// Native UI remains in ../aura_workspace.cpp; rules and services use generated C ABI.
+module aura.workspace.enterprise
+use cpp "../aura_workspace.cpp"
+use rust "../rules/src/lib.rs"
+use go "../services/sync.go"

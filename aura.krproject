@@ -1,0 +1,15 @@
+[project]
+name = "aura_workspace_enterprise"
+version = "2.4.0"
+edition = "2026"
+
+[modules]
+sources = ["app/", "rules/", "services/", "contracts/", "storage/"]
+
+[dependencies]
+packages = []
+
+[build]
+optimization = "O2"
+warnings = "all"
+targets = ["windows-x64", "linux-x64", "android-arm64"]

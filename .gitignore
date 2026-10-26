@@ -1,0 +1,23 @@
+# Generated release output, local databases and workspace-only caches
+KR_BUILD/
+.cache/
+cache/
+rules/target/
+
+# Local secrets and deployment material
+*.db
+*.sqlite
+*.ndjson
+*.key
+*.pem
+*.crt
+*.pfx
+*.token
+
+# Editor and operating system state
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
