@@ -248,6 +248,7 @@ struct AppState {
 
 std::unique_ptr<EnterpriseDatabase> g_Database;
 bool ApplyIncomingRoomChanges(const std::string& batch);
+std::filesystem::path FindWorkspaceRoot();
 int64_t g_CurrentEmployeeId = 0;
 bool g_Authenticated = false;
 
@@ -292,7 +293,8 @@ public:
         fetchChanges_ = reinterpret_cast<FetchChangesFn>(GetProcAddress(module_, "aura_fetch_changes"));
         status_ = reinterpret_cast<StatusFn>(GetProcAddress(module_, "aura_service_status"));
         uploadAttachment_ = reinterpret_cast<UploadAttachmentFn>(GetProcAddress(module_, "aura_upload_attachment"));
-        if (!publish_ || !preflight_ || !reserve_ || !commit_ || !release_ || !flush_ || !fetchChanges_ || !status_) { FreeLibrary(module_); module_ = nullptr; publish_ = nullptr; preflight_ = nullptr; reserve_ = nullptr; commit_ = nullptr; release_ = nullptr; flush_ = nullptr; fetchChanges_ = nullptr; status_ = nullptr; uploadAttachment_ = nullptr; return; }
+        downloadAttachment_ = reinterpret_cast<DownloadAttachmentFn>(GetProcAddress(module_, "aura_download_attachment"));
+        if (!publish_ || !preflight_ || !reserve_ || !commit_ || !release_ || !flush_ || !fetchChanges_ || !status_) { FreeLibrary(module_); module_ = nullptr; publish_ = nullptr; preflight_ = nullptr; reserve_ = nullptr; commit_ = nullptr; release_ = nullptr; flush_ = nullptr; fetchChanges_ = nullptr; status_ = nullptr; uploadAttachment_ = nullptr; downloadAttachment_ = nullptr; return; }
         flush_();
         collectChanges(root);
     }
@@ -311,6 +313,11 @@ public:
         std::string encoded(static_cast<size_t>(bytes), '\0');
         WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, encoded.data(), bytes, nullptr, nullptr);
         return uploadAttachment_(encoded.c_str());
+    }
+    int32_t downloadAttachment(const std::wstring& sha256, const std::wstring& destination) const {
+        if (!downloadAttachment_) return 2;
+        const int hashBytes=WideCharToMultiByte(CP_UTF8,0,sha256.c_str(),-1,nullptr,0,nullptr,nullptr),pathBytes=WideCharToMultiByte(CP_UTF8,0,destination.c_str(),-1,nullptr,0,nullptr,nullptr);
+        if(hashBytes<=1||pathBytes<=1)return 1;std::string hash(static_cast<size_t>(hashBytes),'\0'),path(static_cast<size_t>(pathBytes),'\0');WideCharToMultiByte(CP_UTF8,0,sha256.c_str(),-1,hash.data(),hashBytes,nullptr,nullptr);WideCharToMultiByte(CP_UTF8,0,destination.c_str(),-1,path.data(),pathBytes,nullptr,nullptr);return downloadAttachment_(hash.c_str(),path.c_str());
     }
     const std::wstring& clientId() const { return clientId_; }
     int32_t preflightBooking(int64_t bookingId, int64_t roomId, int64_t start, int64_t end) const { return preflight_ ? preflight_(bookingId, roomId, start, end) : 0; }
@@ -331,6 +338,7 @@ private:
     using FetchChangesFn = int32_t(*)(int64_t, char*, int32_t, int64_t*);
     using StatusFn = int32_t(*)(char*, int32_t);
     using UploadAttachmentFn = int32_t(*)(const char*);
+    using DownloadAttachmentFn = int32_t(*)(const char*, const char*);
     static std::wstring Utf8ToWide(const char* source) {
         if (!source || !*source) return L"";
         const int chars = MultiByteToWideChar(CP_UTF8, 0, source, -1, nullptr, 0);
@@ -348,6 +356,7 @@ private:
     FlushFn flush_ = nullptr;
     StatusFn status_ = nullptr;
     UploadAttachmentFn uploadAttachment_ = nullptr;
+    DownloadAttachmentFn downloadAttachment_ = nullptr;
     FetchChangesFn fetchChanges_ = nullptr;
     std::wstring clientId_;
     std::filesystem::path root_;
@@ -502,6 +511,11 @@ void PublishCommentChange(const EnterpriseComment& comment,const char* topic){
     const std::string id=StableSyncObjectId(L"comment",comment.id),subjectId=StableSyncObjectId(comment.subjectType,comment.subjectId),authorId=StableSyncObjectId(L"employee",comment.authorId);if(id.empty()||subjectId.empty()||authorId.empty())return;
     const std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(comment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"authorId\":"+JsonString(std::wstring(authorId.begin(),authorId.end()))+",\"body\":"+JsonString(comment.body)+"}";g_SyncService.publish(topic,payload);
 }
+void PublishAttachmentChange(const EnterpriseAttachment& attachment,const char* topic){
+    if(!topic||attachment.id<=0||(attachment.subjectType!=L"task"&&attachment.subjectType!=L"ticket"))return;
+    const std::string id=StableSyncObjectId(L"attachment",attachment.id),subjectId=StableSyncObjectId(attachment.subjectType,attachment.subjectId),uploaderId=StableSyncObjectId(L"employee",attachment.uploadedBy);if(id.empty()||subjectId.empty()||uploaderId.empty())return;
+    const std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(attachment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"originalName\":"+JsonString(attachment.originalName)+",\"sizeBytes\":"+std::to_string(attachment.sizeBytes)+",\"sha256\":"+JsonString(attachment.sha256)+",\"uploadedBy\":"+JsonString(std::wstring(uploaderId.begin(),uploaderId.end()))+",\"active\":"+(attachment.active?"true":"false")+"}";g_SyncService.publish(topic,payload);
+}
 
 bool ReadJsonString(const std::string& text, size_t& position, std::string& value) {
     while (position < text.size() && std::isspace(static_cast<unsigned char>(text[position]))) ++position;
@@ -536,7 +550,7 @@ bool ApplyIncomingRoomChanges(const std::string& batch) {
         const size_t topicAt=batch.find("\"topic\"",searchAt); if(topicAt==std::string::npos) break; std::string topic,payload;
         if(!JsonStringField(batch,"topic",topic,topicAt)||!JsonStringField(batch,"payload",payload,topicAt))return false;
         searchAt=topicAt+7;
-        if(topic!="room.created"&&topic!="room.updated"&&topic!="room.archived"&&topic!="project.created"&&topic!="project.updated"&&topic!="project.archived"&&topic!="task.created"&&topic!="task.updated"&&topic!="task.status.changed"&&topic!="task.archived"&&topic!="task.approval.requested"&&topic!="task.approval.decided"&&topic!="comment.created"&&topic!="ticket.created"&&topic!="ticket.updated"&&topic!="ticket.status.changed"&&topic!="ticket.archived"&&topic!="employee.created"&&topic!="employee.updated"&&topic!="employee.presence.changed"&&topic!="employee.archived"&&topic!="organization.created"&&topic!="organization.updated"&&topic!="organization.archived"&&topic!="leave.requested"&&topic!="leave.decided"&&topic!="facility.asset.created"&&topic!="facility.asset.updated"&&topic!="facility.asset.archived"&&topic!="facility.maintenance.created"&&topic!="facility.maintenance.updated"&&topic!="facility.maintenance.status.changed"&&topic!="facility.maintenance.archived")continue;
+        if(topic!="room.created"&&topic!="room.updated"&&topic!="room.archived"&&topic!="project.created"&&topic!="project.updated"&&topic!="project.archived"&&topic!="task.created"&&topic!="task.updated"&&topic!="task.status.changed"&&topic!="task.archived"&&topic!="task.approval.requested"&&topic!="task.approval.decided"&&topic!="comment.created"&&topic!="attachment.created"&&topic!="attachment.archived"&&topic!="ticket.created"&&topic!="ticket.updated"&&topic!="ticket.status.changed"&&topic!="ticket.archived"&&topic!="employee.created"&&topic!="employee.updated"&&topic!="employee.presence.changed"&&topic!="employee.archived"&&topic!="organization.created"&&topic!="organization.updated"&&topic!="organization.archived"&&topic!="leave.requested"&&topic!="leave.decided"&&topic!="facility.asset.created"&&topic!="facility.asset.updated"&&topic!="facility.asset.archived"&&topic!="facility.maintenance.created"&&topic!="facility.maintenance.updated"&&topic!="facility.maintenance.status.changed"&&topic!="facility.maintenance.archived")continue;
         std::string id; if(!JsonStringField(payload,"id",id))return false;
         if(!ownPrefix.empty()&&id.rfind(ownPrefix,0)==0)continue;
         bool active=true; if(!JsonBooleanField(payload,"active",active) && topic.rfind("leave.",0)!=0 && topic!="comment.created")return false;
@@ -547,6 +561,7 @@ bool ApplyIncomingRoomChanges(const std::string& batch) {
         else if(topic.rfind("employee.",0)==0){std::string name,role,department,presence;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"role",role)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"presence",presence))return false;EnterpriseEmployee employee{0,Utf8ToWide(name),Utf8ToWide(role),Utf8ToWide(department),Utf8ToWide(presence),active};if(!g_Database->applySyncedEmployee(Utf8ToWide(id),employee,L"sync.remote"))return false;}
         else if(topic.rfind("room.",0)==0){std::string name,location,equipment;int64_t capacity=0;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"location",location)||!JsonStringField(payload,"equipment",equipment)||!JsonIntegerField(payload,"capacity",capacity))return false;EnterpriseRoom room{0,Utf8ToWide(name),Utf8ToWide(location),static_cast<int>(capacity),Utf8ToWide(equipment),active};if(!g_Database->applySyncedRoom(Utf8ToWide(id),room,L"sync.remote"))return false;}
         else if(topic.rfind("project.",0)==0) {std::string name,department,description,status;int64_t ownerId=0;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"description",description)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"ownerId",ownerId))return false;EnterpriseProject project{0,Utf8ToWide(name),Utf8ToWide(department),Utf8ToWide(description),Utf8ToWide(status),ownerId,active};if(!g_Database->applySyncedProject(Utf8ToWide(id),project,L"sync.remote"))return false;}
+        else if(topic.rfind("attachment.",0)==0){std::string subjectType,subjectId,originalName,sha256,uploadedBy;int64_t sizeBytes=0;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"originalName",originalName)||!JsonStringField(payload,"sha256",sha256)||!JsonStringField(payload,"uploadedBy",uploadedBy)||!JsonIntegerField(payload,"sizeBytes",sizeBytes))return false;const int64_t localSubject=g_Database->syncedLocalId(Utf8ToWide(subjectType),Utf8ToWide(subjectId));if(localSubject<=0)return false;const std::filesystem::path localPath=FindWorkspaceRoot()/L"KR_BUILD"/L"attachments"/Utf8ToWide(subjectType)/std::to_wstring(localSubject)/(L"remote_"+Utf8ToWide(sha256));EnterpriseAttachment attachment{0,Utf8ToWide(subjectType),0,Utf8ToWide(originalName),localPath.wstring(),sizeBytes,Utf8ToWide(sha256),0,L"",active};if(!g_Database->applySyncedAttachment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(uploadedBy),attachment,L"sync.remote"))return false;}
         else if(topic=="comment.created"){std::string subjectType,subjectId,authorId,body;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"authorId",authorId)||!JsonStringField(payload,"body",body))return false;EnterpriseComment comment{0,Utf8ToWide(subjectType),0,0,Utf8ToWide(body),L""};if(!g_Database->applySyncedComment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(authorId),comment,L"sync.remote"))return false;}
         else if(topic.rfind("task.approval.",0)==0){std::string taskId,requestedBy,approverId,status,decidedBy;if(!JsonStringField(payload,"taskId",taskId)||!JsonStringField(payload,"requestedBy",requestedBy)||!JsonStringField(payload,"approverId",approverId)||!JsonStringField(payload,"status",status)||!JsonStringField(payload,"decidedBy",decidedBy))return false;EnterpriseTaskApproval approval{0,0,0,0,Utf8ToWide(status),0,active};if(!g_Database->applySyncedTaskApproval(Utf8ToWide(id),Utf8ToWide(taskId),Utf8ToWide(requestedBy),Utf8ToWide(approverId),Utf8ToWide(decidedBy),approval,L"sync.remote"))return false;}
         else if(topic.rfind("task.",0)==0) {std::string title,department,priority,status;int64_t assignee=0;if(!JsonStringField(payload,"title",title)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"priority",priority)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"assigneeId",assignee))return false;EnterpriseTask task{0,Utf8ToWide(title),Utf8ToWide(department),Utf8ToWide(priority),Utf8ToWide(status),assignee,active};if(!g_Database->applySyncedTask(Utf8ToWide(id),task,L"sync.remote"))return false;}
@@ -1296,9 +1311,10 @@ bool AddAttachmentFromDialog(HWND hwnd, AttachmentManagerContext* context) {
     std::wstring hash;if(!AttachmentSha256(target,hash)){std::filesystem::remove(target,error);MessageBoxW(hwnd,L"Für die Datei konnte kein Integritätshash erzeugt werden.",L"Anhang",MB_ICONERROR);return false;}
     int64_t newId=0;const EnterpriseAttachment attachment{0,context->subjectType,context->subjectId,original,target.wstring(),static_cast<int64_t>(size),hash,g_CurrentEmployeeId,L"",true};if(!g_Database->createAttachment(attachment,newId,L"Ralf Krümmel")){std::filesystem::remove(target,error);MessageBoxW(hwnd,g_Database->error().c_str(),L"Anhang",MB_ICONERROR);return false;}
     // The durable local object is committed first. With a configured central
-    // endpoint the identical SHA-256 object is uploaded immediately; an
-    // upload fault never deletes evidence, but is made explicit to the user.
-    if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)>0 && g_SyncService.uploadAttachment(target.wstring())!=0)MessageBoxW(hwnd,L"Der Anhang wurde lokal revisionssicher gespeichert, konnte aber noch nicht in die Zentrale übertragen werden.",L"Anhang-Synchronisation",MB_ICONWARNING);
+    // endpoint the identical SHA-256 object is uploaded immediately. Metadata
+    // is published only after that binary object exists centrally, so another
+    // client never receives an attachment it cannot retrieve.
+    if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)>0){const int32_t transferred=g_SyncService.uploadAttachment(target.wstring());if(transferred!=0)MessageBoxW(hwnd,L"Der Anhang wurde lokal revisionssicher gespeichert, konnte aber noch nicht in die Zentrale übertragen werden.",L"Anhang-Synchronisation",MB_ICONWARNING);else{EnterpriseAttachment published=attachment;published.id=newId;PublishAttachmentChange(published,"attachment.created");}}
     RefreshAttachmentList(hwnd,context);return true;
 }
 
@@ -1306,7 +1322,7 @@ LRESULT CALLBACK AttachmentManagerProc(HWND hwnd, UINT message, WPARAM wParam, L
     auto* context=reinterpret_cast<AttachmentManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(message){
     case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;
     case WM_CREATE:{context=reinterpret_cast<AttachmentManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));SetWindowTextW(hwnd,(L"Anhänge: "+context->subjectTitle).c_str());CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,18,18,604,210,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Datei hinzufügen",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,125,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ADD),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Öffnen",WS_CHILD|WS_VISIBLE,153,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_OPEN),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Archivieren",WS_CHILD|WS_VISIBLE,253,248,100,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ARCHIVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,532,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_CLOSE),nullptr,nullptr);RefreshAttachmentList(hwnd,context);return 0;}
-    case WM_COMMAND:{const int command=LOWORD(wParam);if(command==IDC_ATTACHMENT_CLOSE){DestroyWindow(hwnd);return 0;}if(command==IDC_ATTACHMENT_ADD){AddAttachmentFromDialog(hwnd,context);return 0;}const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_ATTACHMENT_LIST),LB_GETCURSEL,0,0));if((command==IDC_ATTACHMENT_OPEN||command==IDC_ATTACHMENT_ARCHIVE)&&(selected<0||!context||static_cast<size_t>(selected)>=context->entries.size())){MessageBoxW(hwnd,L"Bitte zuerst einen Anhang auswählen.",L"Anhänge",MB_ICONINFORMATION);return 0;}if(command==IDC_ATTACHMENT_OPEN){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(!std::filesystem::exists(item.storedPath)){MessageBoxW(hwnd,L"Die archivierte Datei ist im Arbeitsbereich nicht mehr vorhanden.",L"Anhänge",MB_ICONERROR);return 0;}if(reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd,L"open",item.storedPath.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(hwnd,L"Die Datei konnte nicht geöffnet werden.",L"Anhänge",MB_ICONERROR);return 0;}if(command==IDC_ATTACHMENT_ARCHIVE){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(MessageBoxW(hwnd,L"Metadaten archivieren? Die Datei bleibt aus Revisionsgründen im Arbeitsbereich erhalten.",L"Anhang archivieren",MB_ICONQUESTION|MB_YESNO)!=IDYES)return 0;if(!g_Database->archiveAttachment(item.id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Anhänge",MB_ICONERROR);return 0;}RefreshAttachmentList(hwnd,context);return 0;}break;}
+    case WM_COMMAND:{const int command=LOWORD(wParam);if(command==IDC_ATTACHMENT_CLOSE){DestroyWindow(hwnd);return 0;}if(command==IDC_ATTACHMENT_ADD){AddAttachmentFromDialog(hwnd,context);return 0;}const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_ATTACHMENT_LIST),LB_GETCURSEL,0,0));if((command==IDC_ATTACHMENT_OPEN||command==IDC_ATTACHMENT_ARCHIVE)&&(selected<0||!context||static_cast<size_t>(selected)>=context->entries.size())){MessageBoxW(hwnd,L"Bitte zuerst einen Anhang auswählen.",L"Anhänge",MB_ICONINFORMATION);return 0;}if(command==IDC_ATTACHMENT_OPEN){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(!std::filesystem::exists(item.storedPath)){if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0||g_SyncService.downloadAttachment(item.sha256,item.storedPath)!=0){MessageBoxW(hwnd,L"Die Datei ist lokal nicht vorhanden und konnte nicht aus der Zentrale geladen werden.",L"Anhänge",MB_ICONERROR);return 0;}}std::wstring localHash;if(!AttachmentSha256(item.storedPath,localHash)||localHash!=item.sha256){MessageBoxW(hwnd,L"Die Integritätsprüfung des Anhangs ist fehlgeschlagen.",L"Anhänge",MB_ICONERROR);return 0;}if(reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd,L"open",item.storedPath.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(hwnd,L"Die Datei konnte nicht geöffnet werden.",L"Anhänge",MB_ICONERROR);return 0;}if(command==IDC_ATTACHMENT_ARCHIVE){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(MessageBoxW(hwnd,L"Metadaten archivieren? Die Datei bleibt aus Revisionsgründen im Arbeitsbereich erhalten.",L"Anhang archivieren",MB_ICONQUESTION|MB_YESNO)!=IDYES)return 0;if(!g_Database->archiveAttachment(item.id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Anhänge",MB_ICONERROR);return 0;}EnterpriseAttachment archived=item;archived.active=false;PublishAttachmentChange(archived,"attachment.archived");RefreshAttachmentList(hwnd,context);return 0;}break;}
     case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,message,wParam,lParam);
 }
 void ShowAttachmentManager(HWND owner,const std::wstring& subjectType,int64_t subjectId,const std::wstring& subjectTitle){auto* context=new AttachmentManagerContext{owner,subjectType,subjectId,subjectTitle};EnableWindow(owner,FALSE);if(!CreateWindowExW(WS_EX_DLGMODALFRAME,L"AuraAttachmentManager",L"Anhänge",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,660,330,owner,nullptr,GetModuleHandleW(nullptr),context)){EnableWindow(owner,TRUE);delete context;}}
@@ -1745,7 +1761,7 @@ void RenderSidebar(HDC hdc, const RECT& clientRc) {
     SelectObject(hdc, g_Fonts.hSmall);
     SetTextColor(hdc, Theme::ACCENT);
     RECT subBrandRc = { 24, 46, 220, 65 };
-    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.0", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
+    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.1", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
 
     const wchar_t* navLabels[] = {
         L" \u25A3  Dashboard",

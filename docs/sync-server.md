@@ -47,7 +47,7 @@ Der Dienst stellt bereit:
 - `POST /api/v1/tickets`, `GET /api/v1/tickets` für zentrale Helpdesk-Tickets. `tickets.manage` steuert die Anlage und vollständige Sicht; die Mitarbeitersicht ist auf eigene bzw. zugewiesene Tickets begrenzt.
 - `POST /api/v1/tickets/{id}/status` für zentral geprüfte Übergänge zwischen offen, in Bearbeitung, gelöst und geschlossen.
 - `GET /api/v1/rooms`, `POST /api/v1/rooms`, `PUT /api/v1/rooms/{id}` und `POST /api/v1/rooms/{id}/archive` für zentral verwaltete Räume einschließlich Standort, Kapazität, Ausstattung und revisionsfähiger Archivierung. Schreibzugriffe verlangen `rooms.manage`; `includeArchived=true` ist ausschließlich für diese Rolle verfügbar.
-- `PUT /api/v1/attachments/{sha256}` und `GET /api/v1/attachments/{sha256}` für zentralen Binäranhangstransport. Der Server akzeptiert maximal 100 MB, prüft den als Pfad und Header angegebenen SHA-256-Wert vor der atomaren Ablage und liefert nur verifizierte Inhalte aus.
+- `PUT /api/v1/attachments/{sha256}` und `GET /api/v1/attachments/{sha256}` für zentralen Binäranhangstransport. Der Server akzeptiert maximal 100 MB, prüft den als Pfad und Header angegebenen SHA-256-Wert vor der atomaren Ablage und liefert nur verifizierte Inhalte aus. Das Windows-Programm veröffentlicht zugehörige Anhangsmetadaten erst nach bestätigter Objektablage; andere Clients legen diese Metadaten lokal ab und laden das Objekt beim Öffnen atomar mit erneuter SHA-256-Prüfung nach.
 - Serverseitige Prüfung überlappender Raumbuchungen mit `409 Conflict`.
 - Wiederherstellung des Buchungsregisters und aller API-Projektionen aus der zentralen SQLite-Ereignishistorie nach Neustart.
 

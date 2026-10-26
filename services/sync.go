@@ -147,6 +147,16 @@ type centralComment struct {
 	AuthorID    string `json:"authorId"`
 	Body        string `json:"body"`
 }
+type centralAttachment struct {
+	ID          string `json:"id"`
+	SubjectType string `json:"subjectType"`
+	SubjectID   string `json:"subjectId"`
+	OriginalName string `json:"originalName"`
+	SizeBytes   int64  `json:"sizeBytes"`
+	SHA256      string `json:"sha256"`
+	UploadedBy  string `json:"uploadedBy"`
+	Active      bool   `json:"active"`
+}
 
 func allows(identity serverIdentity, permission string) bool {
 	for _, value := range identity.Permissions {
@@ -475,6 +485,52 @@ func uploadAttachmentFile(path string) int {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusNoContent {
 		return 8
+	}
+	return 0
+}
+
+// downloadAttachmentFile restores a verified central object into a supplied
+// workspace path. It writes a sibling temporary file and only replaces the
+// target after the response hash and size have been checked.
+func downloadAttachmentFile(digest, destination string) int {
+	endpoint, token := os.Getenv("AURA_SYNC_URL"), os.Getenv("AURA_SYNC_TOKEN")
+	if endpoint == "" || token == "" || len(digest) != 64 {
+		return 6
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return 1
+	}
+	request, err := http.NewRequest(http.MethodGet, strings.TrimRight(endpoint, "/")+"/api/v1/attachments/"+digest, nil)
+	if err != nil {
+		return 7
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
+	if err != nil {
+		return 7
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return 8
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return 1
+	}
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".download-*")
+	if err != nil {
+		return 1
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	hash := sha256.New()
+	limited := io.LimitReader(response.Body, (100<<20)+1)
+	written, copyErr := io.Copy(io.MultiWriter(temp, hash), limited)
+	closeErr := temp.Close()
+	if copyErr != nil || closeErr != nil || written > 100<<20 || hex.EncodeToString(hash.Sum(nil)) != digest {
+		return 1
+	}
+	if err := os.Rename(tempName, destination); err != nil {
+		return 1
 	}
 	return 0
 }
@@ -1493,7 +1549,8 @@ func syncHandler(journal string, token string) http.Handler {
 		if event.At == "" {
 			event.At = time.Now().UTC().Format(time.RFC3339Nano)
 		}
-		if !allows(identity, eventPermission(event.Topic)) && !(event.Topic == "comment.created" && (allows(identity, "tasks.manage") || allows(identity, "tickets.manage") || allows(identity, "sync.events.write"))) {
+		isCollaborative := event.Topic == "comment.created" || event.Topic == "attachment.created" || event.Topic == "attachment.archived"
+		if !allows(identity, eventPermission(event.Topic)) && !(isCollaborative && (allows(identity, "tasks.manage") || allows(identity, "tickets.manage") || allows(identity, "sync.events.write"))) {
 			http.Error(writer, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -1604,6 +1661,25 @@ func syncHandler(journal string, token string) http.Handler {
 				writer.WriteHeader(http.StatusAccepted)
 				return
 			}
+		}
+		var attachment centralAttachment
+		isAttachment := event.Topic == "attachment.created" || event.Topic == "attachment.archived"
+		if isAttachment {
+			if err := json.Unmarshal([]byte(event.Payload), &attachment); err != nil || strings.TrimSpace(attachment.ID) == "" || (attachment.SubjectType != "task" && attachment.SubjectType != "ticket") || strings.TrimSpace(attachment.SubjectID) == "" || strings.TrimSpace(attachment.OriginalName) == "" || attachment.SizeBytes < 0 || len(attachment.SHA256) != 64 || strings.TrimSpace(attachment.UploadedBy) == "" {
+				registry.Unlock()
+				http.Error(writer, "invalid attachment payload", http.StatusBadRequest)
+				return
+			}
+			if _, err := hex.DecodeString(attachment.SHA256); err != nil {
+				registry.Unlock()
+				http.Error(writer, "invalid attachment hash", http.StatusBadRequest)
+				return
+			}
+			if attachment.SubjectType == "task" {
+				if task, found := tasks[attachment.SubjectID]; !found || !task.Active { registry.Unlock(); http.Error(writer, "active attachment task missing", http.StatusConflict); return }
+			} else if ticket, found := tickets[attachment.SubjectID]; !found || !ticket.Active { registry.Unlock(); http.Error(writer, "active attachment ticket missing", http.StatusConflict); return }
+			if event.Topic == "attachment.created" && !attachment.Active { registry.Unlock(); http.Error(writer, "invalid attachment state", http.StatusConflict); return }
+			if event.Topic == "attachment.archived" { attachment.Active = false }
 		}
 		var ticket centralTicket
 		isTicket := event.Topic == "ticket.created" || event.Topic == "ticket.updated" || event.Topic == "ticket.status.changed" || event.Topic == "ticket.archived"
@@ -1827,6 +1903,14 @@ func aura_upload_attachment(path *C.char) C.int {
 		return 1
 	}
 	return C.int(uploadAttachmentFile(C.GoString(path)))
+}
+
+//export aura_download_attachment
+func aura_download_attachment(sha256 *C.char, destination *C.char) C.int {
+	if sha256 == nil || destination == nil {
+		return 1
+	}
+	return C.int(downloadAttachmentFile(C.GoString(sha256), C.GoString(destination)))
 }
 
 //export aura_preflight_booking

@@ -68,6 +68,34 @@ func TestWorkspaceAttachmentUploadUsesCentralObjectStore(t *testing.T) {
 	}
 }
 
+func TestAttachmentMetadataRequiresCentralObjectAndReplays(t *testing.T) {
+	journal := filepath.Join(t.TempDir(), "attachment-events.ndjson")
+	server := httptest.NewServer(syncHandler(journal, "token"))
+	defer server.Close()
+	content := []byte("synchronisierter Nachweis")
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	upload := func(method, path, body string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer token")
+		if method == http.MethodPut { req.Header.Set("X-Aura-SHA256", digest) }
+		response := httptest.NewRecorder(); syncHandler(journal, "token").ServeHTTP(response, req); return response.Code
+	}
+	// Use the same in-memory server handler through HTTP for the object first.
+	req, _ := http.NewRequest(http.MethodPut, server.URL+"/api/v1/attachments/"+digest, bytes.NewReader(content)); req.Header.Set("Authorization", "Bearer token"); req.Header.Set("X-Aura-SHA256", digest)
+	if response, err := http.DefaultClient.Do(req); err != nil || response.StatusCode != http.StatusCreated { if response != nil { response.Body.Close() }; t.Fatalf("central object upload: %v", err) } else { response.Body.Close() }
+	_ = upload
+	task := `{"topic":"task.created","payload":"{\"id\":\"task-evidence\",\"title\":\"Nachweis\",\"department\":\"IT\",\"priority\":\"Mittel\",\"status\":\"open\",\"assigneeId\":1,\"createdBy\":1,\"active\":true}"}`
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/events", strings.NewReader(task)); req.Header.Set("Authorization", "Bearer token")
+	if response, err := http.DefaultClient.Do(req); err != nil || response.StatusCode != http.StatusAccepted { if response != nil { response.Body.Close() }; t.Fatalf("task event: %v", err) } else { response.Body.Close() }
+	attachment := `{"topic":"attachment.created","payload":"{\"id\":\"attachment-evidence\",\"subjectType\":\"task\",\"subjectId\":\"task-evidence\",\"originalName\":\"nachweis.txt\",\"sizeBytes\":24,\"sha256\":\"` + digest + `\",\"uploadedBy\":\"employee-1\",\"active\":true}"}`
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/events", strings.NewReader(attachment)); req.Header.Set("Authorization", "Bearer token")
+	if response, err := http.DefaultClient.Do(req); err != nil || response.StatusCode != http.StatusAccepted { if response != nil { response.Body.Close() }; t.Fatalf("attachment event: %v", err) } else { response.Body.Close() }
+	feed, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/sync/changes?cursor=0", nil); feed.Header.Set("Authorization", "Bearer token")
+	response, err := http.DefaultClient.Do(feed); if err != nil { t.Fatal(err) }; defer response.Body.Close(); var result struct { Events []syncEvent `json:"events"` }; if err := json.NewDecoder(response.Body).Decode(&result); err != nil { t.Fatal(err) }
+	found := false; for _, event := range result.Events { if event.Topic == "attachment.created" && strings.Contains(event.Payload, digest) { found = true } }; if !found { t.Fatalf("attachment metadata missing from change feed: %#v", result.Events) }
+}
+
 func TestPersistEventWritesJsonLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.ndjson")
 	if err := persistEvent(path, syncEvent{Topic: "booking.created", Payload: `{"bookingId":7}`, At: "2026-10-26T10:00:00Z"}); err != nil {

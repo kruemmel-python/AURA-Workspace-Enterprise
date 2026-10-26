@@ -121,6 +121,11 @@ int main() {
     bool syncedApproval=false;for(const EnterpriseTaskApproval& approval:db.taskApprovals(0,true))if(approval.status==L"approved"&&approval.decidedBy>0)syncedApproval=true;assert(syncedApproval);
     assert(db.applySyncedComment(L"remote-device:comment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Synchronisierter Aufgabenkommentar",L""},L"sync-test"));
     bool syncedComment=false;for(const EnterpriseComment& comment:db.commentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))if(comment.body==L"Synchronisierter Aufgabenkommentar")syncedComment=true;assert(syncedComment);
+    const std::wstring remoteAttachmentHash=L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert(db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"remote-evidence.pdf",L"H:\\Aurora_Workspace\\KR_BUILD\\attachments\\task\\remote_evidence",512,remoteAttachmentHash,0,L"",true},L"sync-test"));
+    bool syncedAttachment=false;for(const EnterpriseAttachment& attachment:db.attachmentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))if(attachment.originalName==L"remote-evidence.pdf"&&attachment.sha256==remoteAttachmentHash)syncedAttachment=true;assert(syncedAttachment);
+    assert(db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"remote-evidence.pdf",L"H:\\Aurora_Workspace\\KR_BUILD\\attachments\\task\\remote_evidence",512,remoteAttachmentHash,0,L"",false},L"sync-test"));
+    for(const EnterpriseAttachment& attachment:db.attachmentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))assert(attachment.originalName!=L"remote-evidence.pdf");
     assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"cancelled",requesterId,false}, L"sync-test"));
     assert(db.tasks().front().dueAt == 20000 && db.tasks().front().recurrenceDays == 14);
     assert(db.updateTask({taskId, L"Integration und Lasttest", L"Engineering", L"Kritisch", L"open", requesterId, true, 25000, 7}, L"test"));

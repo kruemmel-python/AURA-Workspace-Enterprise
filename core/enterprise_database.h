@@ -216,6 +216,10 @@ public:
     std::vector<EnterpriseAttachment> attachmentsFor(const std::wstring& subjectType, int64_t subjectId, bool includeArchived = false);
     bool createAttachment(const EnterpriseAttachment& attachment, int64_t& newId, const std::wstring& actor);
     bool archiveAttachment(int64_t attachmentId, const std::wstring& actor);
+    // Imports attachment metadata after its content-addressed binary object has
+    // been accepted by Central. The device-local path is deliberately supplied
+    // by the client and is never replicated between workspaces.
+    bool applySyncedAttachment(const std::wstring& externalId, const std::wstring& subjectExternalId, const std::wstring& uploaderExternalId, const EnterpriseAttachment& attachment, const std::wstring& actor);
     bool createOrResetAccount(int64_t employeeId, const std::wstring& username, const std::wstring& password, bool mustChangePassword, const std::wstring& actor);
     bool authenticate(const std::wstring& username, const std::wstring& password, int64_t nowUtc, EnterpriseAccount& account);
     bool changePassword(int64_t employeeId, const std::wstring& oldPassword, const std::wstring& newPassword, const std::wstring& actor);
