@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.aura.workspace" android:versionCode="20402" android:versionName="2.4.2-live">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.aura.workspace" android:versionCode="20403" android:versionName="2.4.3-live">
   <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="35" />
   <uses-permission android:name="android.permission.INTERNET" />
   <supports-screens android:smallScreens="true" android:normalScreens="true" android:largeScreens="true" android:xlargeScreens="true" android:anyDensity="true" />
