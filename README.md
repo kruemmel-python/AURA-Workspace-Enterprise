@@ -13,7 +13,7 @@ AURA Workspace Enterprise ist ein natives Office-Management-System für Unterneh
 - **Administration:** Konten, Passwortwechsel, Rollenkatalog, Audit, Backup und Wiederherstellung.
 - **Synchronisation:** zentraler Ereignisstrom, persistente Outbox, Cursor-Feed, serverseitige Konfliktentscheidung für Buchungen, stabile Objektzuordnungen und zentraler SHA-256-Objektspeicher für Anhänge.
 
-Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/function-matrix.md).
+Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/function-matrix.md). Die Betriebsanleitung für Administratoren und Servicetechniker steht in [docs/administrator-handbook.md](docs/administrator-handbook.md).
 
 ## Auslieferungsartefakte
 
