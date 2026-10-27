@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"context"
 	sha256pkg "crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -20,6 +23,28 @@ type Client struct {
 	BaseURL, Token string
 	HTTP           *http.Client
 }
+
+// DefaultHTTPClient preserves certificate verification.  If the deployment
+// uses a private enterprise CA, AURA_SYNC_CA_CERT may point at its PEM file.
+func DefaultHTTPClient(timeout time.Duration) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if caPath := strings.TrimSpace(os.Getenv("AURA_SYNC_CA_CERT")); caPath != "" {
+		pem, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read AURA_SYNC_CA_CERT: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("AURA_SYNC_CA_CERT contains no PEM certificate")
+		}
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}, nil
+}
+
 type LeaveRequest struct {
 	ID         string `json:"id"`
 	EmployeeID int64  `json:"employeeId"`
@@ -105,7 +130,11 @@ func (client Client) request(ctx context.Context, method, path string, input any
 	}
 	httpClient := client.HTTP
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		var clientErr error
+		httpClient, clientErr = DefaultHTTPClient(15 * time.Second)
+		if clientErr != nil {
+			return clientErr
+		}
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
@@ -245,7 +274,11 @@ func (client Client) UploadAttachment(ctx context.Context, content io.Reader) (s
 	request.Header.Set("Content-Type", "application/octet-stream")
 	httpClient := client.HTTP
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		var clientErr error
+		httpClient, clientErr = DefaultHTTPClient(15 * time.Second)
+		if clientErr != nil {
+			return "", clientErr
+		}
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
@@ -269,7 +302,11 @@ func (client Client) DownloadAttachment(ctx context.Context, sha256 string) ([]b
 	request.Header.Set("Authorization", "Bearer "+client.Token)
 	httpClient := client.HTTP
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		var clientErr error
+		httpClient, clientErr = DefaultHTTPClient(15 * time.Second)
+		if clientErr != nil {
+			return nil, clientErr
+		}
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
