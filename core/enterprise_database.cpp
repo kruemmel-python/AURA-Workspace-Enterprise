@@ -324,16 +324,18 @@ bool EnterpriseDatabase::archiveRoom(int64_t roomId, const std::wstring& actor) 
 bool EnterpriseDatabase::applySyncedRoom(const std::wstring& externalId, const EnterpriseRoom& room, const std::wstring& actor) {
     if (externalId.empty() || room.name.empty() || room.location.empty() || room.capacity <= 0) { error_ = L"Ungültige zentrale Raumdaten."; return false; }
     if (!execute("BEGIN IMMEDIATE")) return false;
-    sqlite3_stmt* statement = nullptr; int64_t localId = 0;
+    sqlite3_stmt* statement = nullptr; int64_t localId = 0; bool linked = false;
     bool ok = sqlite3_prepare_v2(db_, "SELECT local_id FROM sync_object_links WHERE object_type='room' AND external_id=?", -1, &statement, nullptr) == SQLITE_OK;
-    if (ok) { BindText(statement, 1, externalId); if (sqlite3_step(statement) == SQLITE_ROW) localId = sqlite3_column_int64(statement, 0); }
+    if (ok) { BindText(statement, 1, externalId); if (sqlite3_step(statement) == SQLITE_ROW) { localId = sqlite3_column_int64(statement, 0); linked = true; } }
     if (statement) sqlite3_finalize(statement); statement = nullptr;
+    if (ok && localId == 0) { ok = sqlite3_prepare_v2(db_, "SELECT id FROM rooms WHERE name=? COLLATE NOCASE", -1, &statement, nullptr) == SQLITE_OK; if(ok){BindText(statement,1,room.name);if(sqlite3_step(statement)==SQLITE_ROW)localId=sqlite3_column_int64(statement,0);}if(statement)sqlite3_finalize(statement);statement=nullptr; }
     if (ok && localId == 0) {
         ok = sqlite3_prepare_v2(db_, "INSERT INTO rooms(name,location,capacity,equipment,active) VALUES(?,?,?,?,?)", -1, &statement, nullptr) == SQLITE_OK;
         if (ok) { BindText(statement,1,room.name); BindText(statement,2,room.location); sqlite3_bind_int(statement,3,room.capacity); BindText(statement,4,room.equipment); sqlite3_bind_int(statement,5,room.active?1:0); ok=sqlite3_step(statement)==SQLITE_DONE; }
         if (statement) sqlite3_finalize(statement); statement=nullptr;
-        if (ok) { localId=sqlite3_last_insert_rowid(db_); ok=sqlite3_prepare_v2(db_, "INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('room',?,?)", -1, &statement, nullptr)==SQLITE_OK; if(ok){BindText(statement,1,externalId);sqlite3_bind_int64(statement,2,localId);ok=sqlite3_step(statement)==SQLITE_DONE;} }
+        if (ok) { localId=sqlite3_last_insert_rowid(db_); ok=sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO sync_object_links(object_type,external_id,local_id) VALUES('room',?,?)", -1, &statement, nullptr)==SQLITE_OK; if(ok){BindText(statement,1,externalId);sqlite3_bind_int64(statement,2,localId);ok=sqlite3_step(statement)==SQLITE_DONE;} }
     } else if (ok) {
+        if (!linked) { ok=sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO sync_object_links(object_type,external_id,local_id) VALUES('room',?,?)", -1, &statement, nullptr)==SQLITE_OK; if(ok){BindText(statement,1,externalId);sqlite3_bind_int64(statement,2,localId);ok=sqlite3_step(statement)==SQLITE_DONE;}if(statement)sqlite3_finalize(statement);statement=nullptr; }
         ok = sqlite3_prepare_v2(db_, "UPDATE rooms SET name=?,location=?,capacity=?,equipment=?,active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", -1, &statement, nullptr) == SQLITE_OK;
         if (ok) { BindText(statement,1,room.name); BindText(statement,2,room.location); sqlite3_bind_int(statement,3,room.capacity); BindText(statement,4,room.equipment); sqlite3_bind_int(statement,5,room.active?1:0); sqlite3_bind_int64(statement,6,localId); ok=sqlite3_step(statement)==SQLITE_DONE && sqlite3_changes(db_)==1; }
     }
@@ -554,7 +556,7 @@ bool EnterpriseDatabase::applySyncedProject(const std::wstring& externalId, cons
         if (ok) localId = sqlite3_last_insert_rowid(db_);
     }
     if (ok && !linked) {
-        ok = sqlite3_prepare_v2(db_, "INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('project',?,?)", -1, &statement, nullptr) == SQLITE_OK;
+        ok = sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO sync_object_links(object_type,external_id,local_id) VALUES('project',?,?)", -1, &statement, nullptr) == SQLITE_OK;
         if (ok) { BindText(statement, 1, externalId); sqlite3_bind_int64(statement, 2, localId); ok = sqlite3_step(statement) == SQLITE_DONE; }
         if (statement) sqlite3_finalize(statement); statement = nullptr;
     }

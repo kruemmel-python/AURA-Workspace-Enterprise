@@ -98,6 +98,10 @@ int main() {
     // request must still be retained and become visible to approvers.
     assert(db.applySyncedLeaveRequest(L"mobile-device:leave-9001", {0, 9001, 5000, 6000, L"Mobile Antrag", L"pending", 0, true}, L"sync-test"));
     bool mobileLeaveVisible=false;for(const EnterpriseLeaveRequest& leave:db.leaveRequests(9001,true))if(leave.reason==L"Mobile Antrag"&&leave.status==L"pending")mobileLeaveVisible=true;assert(mobileLeaveVisible);
+    // Mobile projects may reference a server-side owner before a matching
+    // employee master-data event is replayed locally.
+    assert(db.applySyncedProject(L"mobile-device:project-7", {0,L"Mobile Projektprüfung",L"Operations",L"Anzeigeprüfung",L"active",7,true}, L"sync-test"));
+    bool mobileProjectVisible=false;for(const EnterpriseProject& project:db.projects())if(project.name==L"Mobile Projektprüfung"&&project.ownerId==7)mobileProjectVisible=true;assert(mobileProjectVisible);
     int64_t unitId = 0;
     assert(db.createOrganizationUnit({0, L"Engineering", L"ENG", approverIdEmployee, true}, unitId, L"test"));
     assert(db.updateOrganizationUnit({unitId, L"Engineering & Platform", L"ENG", approverIdEmployee, true}, L"test"));

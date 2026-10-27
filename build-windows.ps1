@@ -109,12 +109,20 @@ foreach ($runtimeDll in $runtimeDlls) {
     if (!(Test-Path -LiteralPath $source)) { throw "Benötigte Runtime-DLL fehlt: $source" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $output $runtimeDll) -Force
 }
+$sqliteRuntime = $null
+foreach ($pathEntry in ($env:PATH -split ';')) {
+    if ([string]::IsNullOrWhiteSpace($pathEntry)) { continue }
+    $candidate = Join-Path $pathEntry 'libsqlite3-0.dll'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $sqliteRuntime = $candidate; break }
+}
+if ($null -eq $sqliteRuntime) { throw 'Benötigte SQLite-Runtime libsqlite3-0.dll wurde nicht im Toolchain-Pfad gefunden.' }
+Copy-Item -LiteralPath $sqliteRuntime -Destination (Join-Path $output 'libsqlite3-0.dll') -Force
 
 if (!(Test-Path -LiteralPath (Join-Path $output 'aura_services.dll'))) {
     Write-Warning 'aura_services.dll fehlt: Build mit -WithServices erzeugt den Mehrbenutzer-Synchronisationsdienst.'
 }
-$packageNames = @((Split-Path -Leaf $client), 'aura_services.dll', 'aura-sync-server.exe', 'aura_rules.dll') + $runtimeDlls
-$requiredPackageNames = @((Split-Path -Leaf $client), 'aura_services.dll', 'aura-sync-server.exe', 'aura_rules.dll') + $runtimeDlls
+$packageNames = @((Split-Path -Leaf $client), 'aura_services.dll', 'aura-sync-server.exe', 'aura_rules.dll', 'libsqlite3-0.dll') + $runtimeDlls
+$requiredPackageNames = @((Split-Path -Leaf $client), 'aura_services.dll', 'aura-sync-server.exe', 'aura_rules.dll', 'libsqlite3-0.dll') + $runtimeDlls
 foreach ($requiredPackageName in $requiredPackageNames) {
     $requiredPackagePath = Join-Path $output $requiredPackageName
     if (!(Test-Path -LiteralPath $requiredPackagePath)) { throw "Unvollständiges Produktpaket: $requiredPackageName fehlt in $output" }

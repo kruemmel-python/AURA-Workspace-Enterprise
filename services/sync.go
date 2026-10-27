@@ -8,6 +8,8 @@ import "C"
 import (
 	"bufio"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,6 +29,28 @@ var eventLog = struct {
 	latest string
 }{latest: "Synchronisation bereit"}
 var centralMirror *centralStore
+
+// centralHTTPClient keeps TLS verification enabled.  A private company CA can
+// be supplied explicitly through AURA_SYNC_CA_CERT; public certificates keep
+// using the operating-system trust store without additional configuration.
+func centralHTTPClient(timeout time.Duration) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if caPath := strings.TrimSpace(os.Getenv("AURA_SYNC_CA_CERT")); caPath != "" {
+		certificate, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read AURA_SYNC_CA_CERT: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(certificate) {
+			return nil, fmt.Errorf("AURA_SYNC_CA_CERT contains no PEM certificate")
+		}
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}, nil
+}
 
 type syncEvent struct {
 	Topic   string `json:"topic"`
@@ -148,14 +172,14 @@ type centralComment struct {
 	Body        string `json:"body"`
 }
 type centralAttachment struct {
-	ID          string `json:"id"`
-	SubjectType string `json:"subjectType"`
-	SubjectID   string `json:"subjectId"`
+	ID           string `json:"id"`
+	SubjectType  string `json:"subjectType"`
+	SubjectID    string `json:"subjectId"`
 	OriginalName string `json:"originalName"`
-	SizeBytes   int64  `json:"sizeBytes"`
-	SHA256      string `json:"sha256"`
-	UploadedBy  string `json:"uploadedBy"`
-	Active      bool   `json:"active"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	SHA256       string `json:"sha256"`
+	UploadedBy   string `json:"uploadedBy"`
+	Active       bool   `json:"active"`
 }
 
 func allows(identity serverIdentity, permission string) bool {
@@ -431,7 +455,11 @@ func sendCentralEvent(endpoint, token string, event syncEvent) int {
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(5 * time.Second)
+	if clientErr != nil {
+		return 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return 7
 	}
@@ -478,7 +506,11 @@ func uploadAttachmentFile(path string) int {
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("X-Aura-SHA256", digest)
 	request.Header.Set("Content-Type", "application/octet-stream")
-	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(30 * time.Second)
+	if clientErr != nil {
+		return 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return 7
 	}
@@ -505,7 +537,11 @@ func downloadAttachmentFile(digest, destination string) int {
 		return 7
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(30 * time.Second)
+	if clientErr != nil {
+		return 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return 7
 	}
@@ -551,7 +587,11 @@ func fetchChanges(cursor int) ([]syncEvent, int, int) {
 		return nil, cursor, 7
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(5 * time.Second)
+	if clientErr != nil {
+		return nil, cursor, 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, cursor, 7
 	}
@@ -641,7 +681,11 @@ func preflightBooking(bookingID, roomID, startsAt, endsAt int64) int {
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(5 * time.Second)
+	if clientErr != nil {
+		return 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return 7
 	}
@@ -674,7 +718,11 @@ func centralBookingRequest(path string, body any, accepted ...int) int {
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Content-Type", "application/json")
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	client, clientErr := centralHTTPClient(5 * time.Second)
+	if clientErr != nil {
+		return 7
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return 7
 	}
@@ -1676,10 +1724,24 @@ func syncHandler(journal string, token string) http.Handler {
 				return
 			}
 			if attachment.SubjectType == "task" {
-				if task, found := tasks[attachment.SubjectID]; !found || !task.Active { registry.Unlock(); http.Error(writer, "active attachment task missing", http.StatusConflict); return }
-			} else if ticket, found := tickets[attachment.SubjectID]; !found || !ticket.Active { registry.Unlock(); http.Error(writer, "active attachment ticket missing", http.StatusConflict); return }
-			if event.Topic == "attachment.created" && !attachment.Active { registry.Unlock(); http.Error(writer, "invalid attachment state", http.StatusConflict); return }
-			if event.Topic == "attachment.archived" { attachment.Active = false }
+				if task, found := tasks[attachment.SubjectID]; !found || !task.Active {
+					registry.Unlock()
+					http.Error(writer, "active attachment task missing", http.StatusConflict)
+					return
+				}
+			} else if ticket, found := tickets[attachment.SubjectID]; !found || !ticket.Active {
+				registry.Unlock()
+				http.Error(writer, "active attachment ticket missing", http.StatusConflict)
+				return
+			}
+			if event.Topic == "attachment.created" && !attachment.Active {
+				registry.Unlock()
+				http.Error(writer, "invalid attachment state", http.StatusConflict)
+				return
+			}
+			if event.Topic == "attachment.archived" {
+				attachment.Active = false
+			}
 		}
 		var ticket centralTicket
 		isTicket := event.Topic == "ticket.created" || event.Topic == "ticket.updated" || event.Topic == "ticket.status.changed" || event.Topic == "ticket.archived"

@@ -62,9 +62,10 @@ Für einen Client werden dieselben Serverdaten gesetzt:
 ```powershell
 $env:AURA_SYNC_URL = 'https://server-name:8787'
 $env:AURA_SYNC_TOKEN = 'derselbe-geheimwert'
+$env:AURA_SYNC_CA_CERT = 'H:\Pfad\zur\unternehmens-ca.pem' # nur bei privater Unternehmens-CA
 ```
 
-Bei gesetzter `AURA_SYNC_URL` reserviert der Client vor jeder Buchung, Umbuchung und jedem Serientermin den Zeitraum zentral. Erst nach erfolgreicher lokaler SQLite-Transaktion wird die Reservierung serverseitig als Buchung festgeschrieben. Schlägt eine Seite fehl, wird die Reservierung freigegeben beziehungsweise die lokale Änderung kompensiert. Ein `409 Conflict` verhindert die lokale Speicherung und wird in der Oberfläche angezeigt. Reservierungen laufen serverseitig nach 90 Sekunden ab, falls ein Client abstürzt. Ohne `AURA_SYNC_URL` arbeitet der Client weiter offline und persistiert Ereignisse lokal unter `KR_BUILD\sync-outbox.ndjson`.
+Bei gesetzter `AURA_SYNC_URL` reserviert der Client vor jeder Buchung, Umbuchung und jedem Serientermin den Zeitraum zentral. Erst nach erfolgreicher lokaler SQLite-Transaktion wird die Reservierung serverseitig als Buchung festgeschrieben. Schlägt eine Seite fehl, wird die Reservierung freigegeben beziehungsweise die lokale Änderung kompensiert. Ein `409 Conflict` verhindert die lokale Speicherung und wird in der Oberfläche angezeigt. Reservierungen laufen serverseitig nach 90 Sekunden ab, falls ein Client abstürzt. Ohne `AURA_SYNC_URL` arbeitet der Client weiter offline und persistiert Ereignisse lokal unter `KR_BUILD\sync-outbox.ndjson`. Bei einer privaten Unternehmens-CA setzt der Windows- oder Linux-Client zusätzlich `AURA_SYNC_CA_CERT` auf die PEM-Datei; die TLS-Prüfung bleibt dabei vollständig aktiv.
 
 Ist `AURA_SYNC_URL` gesetzt, aber der Server nicht erreichbar oder antwortet fehlerhaft, wird das Ereignis ebenfalls zunächst in `KR_BUILD\sync-outbox.ndjson` abgelegt. Damit geht eine lokale Änderung bei vorübergehender Netzstörung nicht verloren.
 

@@ -63,6 +63,7 @@ Windows und Linux erhalten je Benutzer:
 ```text
 AURA_SYNC_URL=https://aura.example.com:8787
 AURA_SYNC_TOKEN=<persönlicher-token>
+AURA_SYNC_CA_CERT=/pfad/zur/unternehmens-ca.pem # nur bei privater Unternehmens-CA
 ```
 
 In der Android-App: **Zentrale konfigurieren** öffnen, dieselbe HTTPS-Adresse und den persönlichen Token eintragen, Profil speichern und synchronisieren.
@@ -84,4 +85,4 @@ sudo tar -C /var/lib/aura -czf /var/backups/aura-$(date +%F).tgz aura-central.sq
 sudo systemctl start aura-sync
 ```
 
-Bei TLS-Fehlern DNS-Name, Zertifikatskette, Ablaufdatum und Firewall prüfen. Bei 401/403 Token, Mitarbeiterzuordnung und Rechte prüfen. Bei Synchronisationsproblemen Cursor-Feed und Client-Outbox prüfen.
+Bei TLS-Fehlern DNS-Name, Zertifikatskette, Ablaufdatum und Firewall prüfen. Bei einer privaten Unternehmens-CA muss zusätzlich `AURA_SYNC_CA_CERT` auf die PEM-Datei gesetzt sein; die TLS-Prüfung wird nicht abgeschaltet. Bei 401/403 Token, Mitarbeiterzuordnung und Rechte prüfen. Bei Synchronisationsproblemen Cursor-Feed und Client-Outbox prüfen.

@@ -26,7 +26,7 @@ Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/fun
 | Android | `android-arm64/aura-workspace-mobile.apk` – universelle Java/Android-Touch-App für API 23 bis 35 |
 | Integrität | `release-manifest.json` mit SHA-256-Prüfsummen |
 
-Die mobile Touch-App unterstützt ein privates HTTPS-Verbindungsprofil, zentrale Ansichten sowie Projekte, Aufgaben, Tickets, Räume und Urlaubsanträge.
+Die mobile Touch-App unterstützt ein privates HTTPS-Verbindungsprofil, zentrale Ansichten sowie Projekte, Aufgaben, Tickets, Räume und Urlaubsanträge. Einträge werden in der jeweiligen Übersicht angetippt und öffnen unmittelbar ein vorausgefülltes Verwaltungsformular; Statuswechsel, Bearbeiten und Archivieren benötigen daher keine manuelle Eingabe technischer IDs.
 
 ## Build
 
@@ -60,6 +60,7 @@ Keine Tokens, Zertifikate, Datenbanken, Anhänge oder erzeugten Caches gehören 
 
 - Rollen und Fachberechtigungen werden auf Client und Server geprüft.
 - Zentraler Betrieb verwendet TLS und tokengebundene Identitäten.
+- Für private Unternehmens-CAs kann der Windows- oder Linux-Client die PEM-Datei über `AURA_SYNC_CA_CERT` einbinden; die Zertifikatsprüfung bleibt aktiv.
 - Anhänge sind auf 100 MB begrenzt und werden mit SHA-256 geprüft.
 - Audit-Ereignisse und Fachobjekte werden persistent in SQLite abgelegt.
 - Der Windows-Build verpackt Runtime-DLLs automatisch zusammen mit der EXE.
