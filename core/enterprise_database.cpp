@@ -532,12 +532,41 @@ bool EnterpriseDatabase::archiveProject(int64_t projectId, const std::wstring& a
 bool EnterpriseDatabase::applySyncedProject(const std::wstring& externalId, const EnterpriseProject& project, const std::wstring& actor) {
     if (externalId.empty() || project.name.empty() || project.department.empty() || project.ownerId <= 0 || (project.status != L"planned" && project.status != L"active" && project.status != L"on_hold" && project.status != L"completed" && project.status != L"cancelled")) { error_ = L"Ungültige zentrale Projektdaten."; return false; }
     if (!execute("BEGIN IMMEDIATE")) return false;
-    sqlite3_stmt* statement = nullptr; int64_t localId = 0;
+    sqlite3_stmt* statement = nullptr;
+    int64_t localId = 0;
+    bool linked = false;
     bool ok = sqlite3_prepare_v2(db_, "SELECT local_id FROM sync_object_links WHERE object_type='project' AND external_id=?", -1, &statement, nullptr) == SQLITE_OK;
-    if (ok) { BindText(statement,1,externalId); if(sqlite3_step(statement)==SQLITE_ROW)localId=sqlite3_column_int64(statement,0); }
-    if(statement)sqlite3_finalize(statement);statement=nullptr;
-    if(ok&&localId==0){ok=sqlite3_prepare_v2(db_,"INSERT INTO projects(name,department,description,status,owner_id,active) VALUES(?,?,?,?,?,?)",-1,&statement,nullptr)==SQLITE_OK;if(ok){BindText(statement,1,project.name);BindText(statement,2,project.department);BindText(statement,3,project.description);BindText(statement,4,project.status);sqlite3_bind_int64(statement,5,project.ownerId);sqlite3_bind_int(statement,6,project.active?1:0);ok=sqlite3_step(statement)==SQLITE_DONE;}if(statement)sqlite3_finalize(statement);statement=nullptr;if(ok){localId=sqlite3_last_insert_rowid(db_);ok=sqlite3_prepare_v2(db_,"INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('project',?,?)",-1,&statement,nullptr)==SQLITE_OK;if(ok){BindText(statement,1,externalId);sqlite3_bind_int64(statement,2,localId);ok=sqlite3_step(statement)==SQLITE_DONE;}}}else if(ok){ok=sqlite3_prepare_v2(db_,"UPDATE projects SET name=?,department=?,description=?,status=?,owner_id=?,active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",-1,&statement,nullptr)==SQLITE_OK;if(ok){BindText(statement,1,project.name);BindText(statement,2,project.department);BindText(statement,3,project.description);BindText(statement,4,project.status);sqlite3_bind_int64(statement,5,project.ownerId);sqlite3_bind_int(statement,6,project.active?1:0);sqlite3_bind_int64(statement,7,localId);ok=sqlite3_step(statement)==SQLITE_DONE&&sqlite3_changes(db_)==1;}}
-    if(statement)sqlite3_finalize(statement);if(ok)ok=audit(actor,L"sync.project.applied",externalId);execute(ok?"COMMIT":"ROLLBACK");if(!ok)setError("Zentrales Projekt konnte nicht übernommen werden");return ok;
+    if (ok) { BindText(statement, 1, externalId); if (sqlite3_step(statement) == SQLITE_ROW) { localId = sqlite3_column_int64(statement, 0); linked = true; } }
+    if (statement) sqlite3_finalize(statement); statement = nullptr;
+
+    // A newly provisioned client can already contain the same seeded project.
+    // Match that stable natural key first and then establish the missing link;
+    // otherwise the UNIQUE project name would stop the complete cursor feed.
+    if (ok && localId == 0) {
+        ok = sqlite3_prepare_v2(db_, "SELECT id FROM projects WHERE name=? COLLATE NOCASE", -1, &statement, nullptr) == SQLITE_OK;
+        if (ok) { BindText(statement, 1, project.name); if (sqlite3_step(statement) == SQLITE_ROW) localId = sqlite3_column_int64(statement, 0); }
+        if (statement) sqlite3_finalize(statement); statement = nullptr;
+    }
+    if (ok && localId == 0) {
+        ok = sqlite3_prepare_v2(db_, "INSERT INTO projects(name,department,description,status,owner_id,active) VALUES(?,?,?,?,?,?)", -1, &statement, nullptr) == SQLITE_OK;
+        if (ok) { BindText(statement, 1, project.name); BindText(statement, 2, project.department); BindText(statement, 3, project.description); BindText(statement, 4, project.status); sqlite3_bind_int64(statement, 5, project.ownerId); sqlite3_bind_int(statement, 6, project.active ? 1 : 0); ok = sqlite3_step(statement) == SQLITE_DONE; }
+        if (statement) sqlite3_finalize(statement); statement = nullptr;
+        if (ok) localId = sqlite3_last_insert_rowid(db_);
+    }
+    if (ok && !linked) {
+        ok = sqlite3_prepare_v2(db_, "INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('project',?,?)", -1, &statement, nullptr) == SQLITE_OK;
+        if (ok) { BindText(statement, 1, externalId); sqlite3_bind_int64(statement, 2, localId); ok = sqlite3_step(statement) == SQLITE_DONE; }
+        if (statement) sqlite3_finalize(statement); statement = nullptr;
+    }
+    if (ok) {
+        ok = sqlite3_prepare_v2(db_, "UPDATE projects SET name=?,department=?,description=?,status=?,owner_id=?,active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", -1, &statement, nullptr) == SQLITE_OK;
+        if (ok) { BindText(statement, 1, project.name); BindText(statement, 2, project.department); BindText(statement, 3, project.description); BindText(statement, 4, project.status); sqlite3_bind_int64(statement, 5, project.ownerId); sqlite3_bind_int(statement, 6, project.active ? 1 : 0); sqlite3_bind_int64(statement, 7, localId); ok = sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(db_) == 1; }
+    }
+    if (statement) sqlite3_finalize(statement);
+    if (ok) ok = audit(actor, L"sync.project.applied", externalId);
+    execute(ok ? "COMMIT" : "ROLLBACK");
+    if (!ok) setError("Zentrales Projekt konnte nicht übernommen werden");
+    return ok;
 }
 
 bool EnterpriseDatabase::assignTaskToProject(int64_t taskId, int64_t projectId, const std::wstring& actor) {
@@ -1106,7 +1135,19 @@ bool EnterpriseDatabase::decideLeaveRequest(int64_t requestId, bool approved, in
 }
 
 bool EnterpriseDatabase::applySyncedLeaveRequest(const std::wstring& externalId, const EnterpriseLeaveRequest& request, const std::wstring& actor) {
-    if(externalId.empty()||request.employeeId<=0||request.startsAt<=0||request.endsAt<=request.startsAt||request.reason.empty()||(request.status!=L"pending"&&request.status!=L"approved"&&request.status!=L"rejected")){error_=L"Ungültige zentrale Abwesenheitsdaten.";return false;}if(!execute("BEGIN IMMEDIATE"))return false;sqlite3_stmt* s=nullptr;int64_t local=0;bool ok=sqlite3_prepare_v2(db_,"SELECT local_id FROM sync_object_links WHERE object_type='leave' AND external_id=?",-1,&s,nullptr)==SQLITE_OK;if(ok){BindText(s,1,externalId);if(sqlite3_step(s)==SQLITE_ROW)local=sqlite3_column_int64(s,0);}if(s)sqlite3_finalize(s);s=nullptr;if(ok&&local==0){ok=sqlite3_prepare_v2(db_,"INSERT INTO leave_requests(employee_id,starts_at,ends_at,reason,status,decided_by,active) VALUES(?,?,?,?,?,?,?)",-1,&s,nullptr)==SQLITE_OK;if(ok){sqlite3_bind_int64(s,1,request.employeeId);sqlite3_bind_int64(s,2,request.startsAt);sqlite3_bind_int64(s,3,request.endsAt);BindText(s,4,request.reason);BindText(s,5,request.status);sqlite3_bind_int64(s,6,request.decidedBy);sqlite3_bind_int(s,7,request.active?1:0);ok=sqlite3_step(s)==SQLITE_DONE;}if(s)sqlite3_finalize(s);s=nullptr;if(ok){local=sqlite3_last_insert_rowid(db_);ok=sqlite3_prepare_v2(db_,"INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('leave',?,?)",-1,&s,nullptr)==SQLITE_OK;if(ok){BindText(s,1,externalId);sqlite3_bind_int64(s,2,local);ok=sqlite3_step(s)==SQLITE_DONE;}}}else if(ok){ok=sqlite3_prepare_v2(db_,"UPDATE leave_requests SET employee_id=?,starts_at=?,ends_at=?,reason=?,status=?,decided_by=?,active=? WHERE id=?",-1,&s,nullptr)==SQLITE_OK;if(ok){sqlite3_bind_int64(s,1,request.employeeId);sqlite3_bind_int64(s,2,request.startsAt);sqlite3_bind_int64(s,3,request.endsAt);BindText(s,4,request.reason);BindText(s,5,request.status);sqlite3_bind_int64(s,6,request.decidedBy);sqlite3_bind_int(s,7,request.active?1:0);sqlite3_bind_int64(s,8,local);ok=sqlite3_step(s)==SQLITE_DONE;}}if(s)sqlite3_finalize(s);if(ok)ok=audit(actor,L"sync.leave.applied",externalId);execute(ok?"COMMIT":"ROLLBACK");if(!ok)setError("Zentraler Urlaubsantrag konnte nicht übernommen werden");return ok;
+    if(externalId.empty()||request.employeeId<=0||request.startsAt<=0||request.endsAt<=request.startsAt||request.reason.empty()||(request.status!=L"pending"&&request.status!=L"approved"&&request.status!=L"rejected")){error_=L"Ungültige zentrale Abwesenheitsdaten.";return false;}
+    if(!execute("BEGIN IMMEDIATE"))return false;
+    sqlite3_stmt* s=nullptr;int64_t local=0;
+    // Mobile identities can arrive before their employee master data. Preserve
+    // the request and provision an explicit, auditable placeholder instead of
+    // rejecting the whole synchronization batch on the foreign key.
+    bool ok=sqlite3_prepare_v2(db_,"SELECT 1 FROM employees WHERE id=?",-1,&s,nullptr)==SQLITE_OK;
+    if(ok){sqlite3_bind_int64(s,1,request.employeeId);const int result=sqlite3_step(s);ok=result==SQLITE_ROW||result==SQLITE_DONE;}
+    bool employeeExists=ok&&s&&sqlite3_data_count(s)>0;if(s)sqlite3_finalize(s);s=nullptr;
+    if(ok&&!employeeExists){ok=sqlite3_prepare_v2(db_,"INSERT INTO employees(id,name,role,department,presence,active) VALUES(?,?,?,?,?,1)",-1,&s,nullptr)==SQLITE_OK;if(ok){sqlite3_bind_int64(s,1,request.employeeId);BindText(s,2,L"Synchronisierte Identität "+std::to_wstring(request.employeeId));BindText(s,3,L"Extern");BindText(s,4,L"Mobile Synchronisation");BindText(s,5,L"unknown");ok=sqlite3_step(s)==SQLITE_DONE;}if(s)sqlite3_finalize(s);s=nullptr;}
+    if(ok){ok=sqlite3_prepare_v2(db_,"SELECT local_id FROM sync_object_links WHERE object_type='leave' AND external_id=?",-1,&s,nullptr)==SQLITE_OK;if(ok){BindText(s,1,externalId);if(sqlite3_step(s)==SQLITE_ROW)local=sqlite3_column_int64(s,0);}if(s)sqlite3_finalize(s);s=nullptr;}
+    if(ok&&local==0){ok=sqlite3_prepare_v2(db_,"INSERT INTO leave_requests(employee_id,starts_at,ends_at,reason,status,decided_by,active) VALUES(?,?,?,?,?,?,?)",-1,&s,nullptr)==SQLITE_OK;if(ok){sqlite3_bind_int64(s,1,request.employeeId);sqlite3_bind_int64(s,2,request.startsAt);sqlite3_bind_int64(s,3,request.endsAt);BindText(s,4,request.reason);BindText(s,5,request.status);sqlite3_bind_int64(s,6,request.decidedBy);sqlite3_bind_int(s,7,request.active?1:0);ok=sqlite3_step(s)==SQLITE_DONE;}if(s)sqlite3_finalize(s);s=nullptr;if(ok){local=sqlite3_last_insert_rowid(db_);ok=sqlite3_prepare_v2(db_,"INSERT INTO sync_object_links(object_type,external_id,local_id) VALUES('leave',?,?)",-1,&s,nullptr)==SQLITE_OK;if(ok){BindText(s,1,externalId);sqlite3_bind_int64(s,2,local);ok=sqlite3_step(s)==SQLITE_DONE;}}}else if(ok){ok=sqlite3_prepare_v2(db_,"UPDATE leave_requests SET employee_id=?,starts_at=?,ends_at=?,reason=?,status=?,decided_by=?,active=? WHERE id=?",-1,&s,nullptr)==SQLITE_OK;if(ok){sqlite3_bind_int64(s,1,request.employeeId);sqlite3_bind_int64(s,2,request.startsAt);sqlite3_bind_int64(s,3,request.endsAt);BindText(s,4,request.reason);BindText(s,5,request.status);sqlite3_bind_int64(s,6,request.decidedBy);sqlite3_bind_int(s,7,request.active?1:0);sqlite3_bind_int64(s,8,local);ok=sqlite3_step(s)==SQLITE_DONE;}}
+    if(s)sqlite3_finalize(s);if(ok)ok=audit(actor,L"sync.leave.applied",externalId);execute(ok?"COMMIT":"ROLLBACK");if(!ok)setError("Zentraler Urlaubsantrag konnte nicht übernommen werden");return ok;
 }
 
 std::vector<EnterpriseOrganizationUnit> EnterpriseDatabase::organizationUnits(bool includeArchived) {
