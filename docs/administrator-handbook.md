@@ -71,7 +71,7 @@ In der Android-App: **Zentrale konfigurieren** öffnen, dieselbe HTTPS-Adresse u
 
 - `/health` antwortet über HTTPS mit HTTP 200.
 - Raum-, Projekt-, Aufgaben- und Ticketdaten sind nach Synchronisation auf einem zweiten Client sichtbar.
-- Ein Android-Urlaubsantrag erscheint im Windows-Client unter **Administration → Abwesenheiten**; nach Genehmigung zeigt Android unter **Meine Urlaubsanträge** den Status **Genehmigt**.
+- Ein Android-Urlaubsantrag erscheint im Windows-Client unter **Administration → Abwesenheiten**; nach Genehmigung zeigt Android unter **Meine Urlaubsanträge** den Status **Genehmigt**. Die geöffnete Ansicht fragt den Status alle 30 Sekunden erneut über HTTPS ab; **Status jetzt aktualisieren** löst die Abfrage sofort aus.
 - Überlappende Raumbuchungen werden zentral abgewiesen.
 - Audit, Backup und Wiederherstellung werden vor Produktivsetzung geprüft.
 
