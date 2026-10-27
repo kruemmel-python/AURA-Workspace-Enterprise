@@ -1,6 +1,6 @@
 [project]
 name = "aura_workspace_enterprise"
-version = "2.4.1"
+version = "2.4.2"
 edition = "2026"
 
 [modules]

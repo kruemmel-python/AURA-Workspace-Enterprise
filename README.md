@@ -23,7 +23,7 @@ Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/fun
 | --- | --- |
 | Windows x64 | `windows-x64/AURA-Workspace-Enterprise.exe` einschließlich aller benötigten DLLs und Synchronisationsserver |
 | Linux x64 | `linux-x64/aura-workspace-enterprise` (ELF) |
-| Android ARM64 | `android-arm64/aura-workspace-enterprise.apk` und `android-arm64/aura-workspace-mobile.apk` |
+| Android | `android-arm64/aura-workspace-mobile.apk` – universelle Java/Android-Touch-App für API 23 bis 35 |
 | Integrität | `release-manifest.json` mit SHA-256-Prüfsummen |
 
 Die mobile Touch-App unterstützt ein privates HTTPS-Verbindungsprofil, zentrale Ansichten sowie Projekte, Aufgaben, Tickets, Räume und Urlaubsanträge.

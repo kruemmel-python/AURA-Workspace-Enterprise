@@ -3,7 +3,7 @@ $ErrorActionPreference='Stop'
 $root=$PSScriptRoot;$sdk='C:\Users\ralfk\AppData\Local\Android\Sdk';$bt=Join-Path $sdk 'build-tools\36.0.0';$platform=Join-Path $sdk 'platforms\android-35\android.jar';$jdk='H:\KR-Compiler\KR-Compiler-Windows-x64-v4.3.1\runtime\jdk\bin';$source=Join-Path $root 'clients\android-ui';$work=Join-Path $root 'KR_BUILD\android-ui-work';$out=Join-Path $root 'KR_BUILD\android-arm64';$aapt2=Join-Path $bt 'aapt2.exe';$d8=Join-Path $bt 'd8.bat';$signer=Join-Path $bt 'apksigner.bat';
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force -Path $work,$out | Out-Null
 & $aapt2 compile --dir (Join-Path $source 'res') -o (Join-Path $work 'res.zip')
-& $aapt2 link -I $platform --manifest (Join-Path $source 'AndroidManifest.xml') --auto-add-overlay --java (Join-Path $work 'generated') -o (Join-Path $work 'base.apk') -R (Join-Path $work 'res.zip')
+& $aapt2 link -I $platform --manifest (Join-Path $source 'AndroidManifest.xml') --min-sdk-version 23 --target-sdk-version 35 --auto-add-overlay --java (Join-Path $work 'generated') -o (Join-Path $work 'base.apk') -R (Join-Path $work 'res.zip')
 & (Join-Path $jdk 'javac.exe') -source 8 -target 8 -classpath $platform -d (Join-Path $work 'classes') (Join-Path $work 'generated\com\aura\workspace\R.java') (Join-Path $source 'src\com\aura\workspace\MainActivity.java')
 New-Item -ItemType Directory -Force -Path (Join-Path $work 'dex') | Out-Null
 $classFiles=Get-ChildItem -LiteralPath (Join-Path $work 'classes') -Recurse -Filter *.class | Select-Object -ExpandProperty FullName

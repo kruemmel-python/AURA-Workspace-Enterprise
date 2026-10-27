@@ -1761,7 +1761,7 @@ void RenderSidebar(HDC hdc, const RECT& clientRc) {
     SelectObject(hdc, g_Fonts.hSmall);
     SetTextColor(hdc, Theme::ACCENT);
     RECT subBrandRc = { 24, 46, 220, 65 };
-    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.1", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
+    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.2", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
 
     const wchar_t* navLabels[] = {
         L" \u25A3  Dashboard",

@@ -82,4 +82,4 @@ Für Linux- und Android-Adapter steht zusätzlich das reine Go-Paket `services/p
 
 ## Plattform-Artefakte
 
-`build-enterprise.ps1 -SmokeTest` ist der gemeinsame Release-Einstieg. Er erzeugt den getesteten Windows-Ordner, `KR_BUILD\linux-x64\aura-workspace-enterprise` als Linux-x64-ELF sowie die signierten Android-ARM64-APKs `aura-workspace-enterprise.apk` (nativer Runner) und `aura-workspace-mobile.apk` (native Android-Touch-App). Alle Build-Caches, temporären Dateien und das lokale Android-Signaturmaterial liegen ausschließlich innerhalb von `H:\Aurora_Workspace`.
+`build-enterprise.ps1 -SmokeTest` ist der gemeinsame Release-Einstieg. Er erzeugt den getesteten Windows-Ordner, `KR_BUILD\linux-x64\aura-workspace-enterprise` als Linux-x64-ELF sowie `KR_BUILD\android-arm64\aura-workspace-mobile.apk` als signierte, universelle Android-Touch-App für API 23 bis 35. Der interne KR-Runner wird nicht als Endkunden-Artefakt ausgeliefert. Alle Build-Caches, temporären Dateien und das lokale Android-Signaturmaterial liegen ausschließlich innerhalb von `H:\Aurora_Workspace`.
