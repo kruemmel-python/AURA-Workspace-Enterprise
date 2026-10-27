@@ -94,6 +94,10 @@ int main() {
     assert(db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"pending", 0, true}, L"sync-test"));
     assert(db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"approved", approverIdEmployee, true}, L"sync-test"));
     bool syncedLeaveApproved=false;for(const EnterpriseLeaveRequest& leave:db.leaveRequests(requesterId,true))if(leave.reason==L"Remote Erholung"&&leave.status==L"approved"&&leave.decidedBy==approverIdEmployee)syncedLeaveApproved=true;assert(syncedLeaveApproved);
+    // A mobile identity can arrive before an employee master-data event. The
+    // request must still be retained and become visible to approvers.
+    assert(db.applySyncedLeaveRequest(L"mobile-device:leave-9001", {0, 9001, 5000, 6000, L"Mobile Antrag", L"pending", 0, true}, L"sync-test"));
+    bool mobileLeaveVisible=false;for(const EnterpriseLeaveRequest& leave:db.leaveRequests(9001,true))if(leave.reason==L"Mobile Antrag"&&leave.status==L"pending")mobileLeaveVisible=true;assert(mobileLeaveVisible);
     int64_t unitId = 0;
     assert(db.createOrganizationUnit({0, L"Engineering", L"ENG", approverIdEmployee, true}, unitId, L"test"));
     assert(db.updateOrganizationUnit({unitId, L"Engineering & Platform", L"ENG", approverIdEmployee, true}, L"test"));
