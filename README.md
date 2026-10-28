@@ -17,11 +17,11 @@ Eine erste GTK-3-Oberfläche im Windows-Stil ist unter `clients/linux/` verfügb
 - **Administration:** Konten, Passwortwechsel, Rollenkatalog, Audit, Backup und Wiederherstellung.
 - **Synchronisation:** zentraler Ereignisstrom, persistente Outbox, Cursor-Feed, serverseitige Konfliktentscheidung für Buchungen, stabile Objektzuordnungen und zentraler SHA-256-Objektspeicher für Anhänge.
 
-Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/function-matrix.md). Die Betriebsanleitung für Administratoren und Servicetechniker steht in [docs/administrator-handbook.md](docs/administrator-handbook.md).
+Die vollständige Nachweisübersicht steht in [docs/function-matrix.md](docs/function-matrix.md). Die Betriebsanleitung für Administratoren und Servicetechniker steht in [docs/administrator-handbook.md](docs/administrator-handbook.md). Eine ausführliche Dokumentation zur Projektarchitektur und zum Build mit der KR Compiler IDE steht in [docs/kr-compiler-build-guide.md](docs/kr-compiler-build-guide.md).
 
 ## Auslieferungsartefakte
 
-`build-enterprise.ps1 -SmokeTest` erzeugt unter `KR_BUILD`:
+`./build-enterprise.sh` (Linux) bzw. `build-enterprise.ps1 -SmokeTest` (Windows) erzeugt unter `KR_BUILD`:
 
 | Plattform | Artefakt |
 | --- | --- |
@@ -34,14 +34,28 @@ Die mobile Touch-App unterstützt ein privates HTTPS-Verbindungsprofil, zentrale
 
 ## Build
 
-Voraussetzung ist die konfigurierte KR-Toolchain unter `H:\KR-Compiler\KR-Compiler-Windows-x64-v4.3.1\toolchain`.
+Voraussetzung ist die konfigurierte KR-Toolchain unter `$HOME/KR-Compiler/KR-Compiler-Linux-x64-v4.3.1/toolchain` (Linux) bzw. `H:\KR-Compiler\KR-Compiler-Windows-x64-v4.3.1\toolchain` (Windows).
 
+### Linux (Gesamtbuild aller Plattformen)
+```bash
+cd ~/Aurora_Workspace/AURA-Workspace-Enterprise
+./build-enterprise.sh
+```
+
+Paketierung einzelner Distributions-Archive:
+```bash
+bash clients/linux/package.sh   "$PWD/KR_BUILD/dist/AURA-Workspace-Enterprise-v2.4.5-linux-x64.tar.gz"
+bash clients/windows/package.sh "$PWD/KR_BUILD/dist/AURA-Workspace-Enterprise-v2.4.5-windows-x64.zip"
+bash clients/android/package.sh "$PWD/KR_BUILD/dist/AURA-Workspace-Enterprise-v2.4.5-android.apk"
+```
+
+### Windows (PowerShell)
 ```powershell
 Set-Location H:\Aurora_Workspace
 .\build-enterprise.ps1 -SmokeTest
 ```
 
-Der Gesamtbuild prüft die KR-Projektpipeline, Rust-Geschäftsregeln, Enterprise-Datenbanktests, Go-Synchronisationsdienste, Windows-Laufzeit, Linux-ELF und die Android-Signaturen. Alle Build-Caches und temporären Ausgaben bleiben in `H:\Aurora_Workspace`.
+Der Gesamtbuild prüft die KR-Projektpipeline, Rust-Geschäftsregeln, Enterprise-Datenbanktests, Go-Synchronisationsdienste, Windows-Laufzeit, Linux-ELF und die Android-Signaturen. Alle Build-Caches und temporären Ausgaben bleiben im Arbeitsbereich. Details: [docs/kr-compiler-build-guide.md](docs/kr-compiler-build-guide.md).
 
 ## Zentraler Betrieb
 
