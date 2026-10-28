@@ -13,7 +13,7 @@ sudo useradd --system --home /opt/aura --shell /usr/sbin/nologin aura
 sudo install -d -o aura -g aura -m 750 /opt/aura /var/lib/aura /etc/aura /var/log/aura
 sudo -u aura git clone https://github.com/kruemmel-python/AURA-Workspace-Enterprise.git /opt/aura/src
 cd /opt/aura/src/services
-sudo -u aura env CGO_ENABLED=1 go build -trimpath -o /opt/aura/aura-sync-server sync.go
+sudo -u aura env CGO_ENABLED=1 go build -trimpath -o /opt/aura/aura-sync-server .
 ```
 
 Der zentrale Server nutzt SQLite über cgo und wird deshalb auf Linux nativ gebaut. Der portable Linux-Client aus dem Release benötigt diesen Build nicht.

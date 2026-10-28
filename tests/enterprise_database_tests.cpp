@@ -1,8 +1,10 @@
+#include <limits>
 #include "../core/enterprise_database.h"
 
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <sqlite3.h>
 
 int main() {
     const std::wstring path = L"KR_BUILD/test-enterprise.db";
@@ -50,6 +52,64 @@ int main() {
     assert(!db.createRecurringBookings({0, roomId, 1, 2000, 2100, 4, L"confirmed"}, 7, 3, seriesIds, L"test"));
     assert(seriesIds.empty());
     assert(db.bookingsForRoom(roomId).size() == bookingsBeforeRejectedSeries);
+    // Remote bookings have independent identities and never overwrite a
+    // locally modified or conflicting calendar entry.
+    assert(db.ensureSyncedExternalId(L"room",roomId,L"room:shared"));
+    EnterpriseBooking remoteBooking{0,0,0,20000,20100,2,L"confirmed"};
+    assert(!db.applySyncedBooking(L"linux",4,L"room:missing",remoteBooking,L"",L"sync-test"));
+    assert(db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(db.activeBookingForRoom(roomId,20050,active));const int64_t remoteLocal=active.id;assert(active.userId==0);
+    remoteBooking.startUtc=400;remoteBooking.endUtc=450;
+    assert(!db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(db.activeBookingForRoom(roomId,20050,active) && active.id==remoteLocal);
+    remoteBooking.startUtc=21000;remoteBooking.endUtc=21100;
+    sqlite3* remoteFault=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&remoteFault)==SQLITE_OK);
+    assert(sqlite3_exec(remoteFault,"CREATE TRIGGER fail_remote_booking_audit BEFORE INSERT ON audit_log WHEN NEW.action='sync.booking.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(db.activeBookingForRoom(roomId,20050,active));
+    assert(sqlite3_exec(remoteFault,"DROP TRIGGER fail_remote_booking_audit",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(db.activeBookingForRoom(roomId,21050,active) && active.id==remoteLocal);
+    assert(sqlite3_exec(remoteFault,("UPDATE bookings SET attendees=7 WHERE id="+std::to_string(remoteLocal)).c_str(),nullptr,nullptr,nullptr)==SQLITE_OK);
+    remoteBooking.status=L"cancelled";
+    assert(!db.applySyncedBooking(L"linux",4,L"room:shared",remoteBooking,L"",L"sync-test"));
+    assert(sqlite3_exec(remoteFault,("UPDATE bookings SET attendees=2 WHERE id="+std::to_string(remoteLocal)).c_str(),nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(remoteFault);
+    assert(db.cancelSyncedBooking(L"linux",4,L"sync-test"));
+    assert(db.cancelSyncedBooking(L"linux",4,L"sync-test"));
+    assert(db.cancelSyncedBooking(L"unknown-device",4,L"sync-test"));
+    assert(!db.activeBookingForRoom(roomId,21050,active));
+    EnterpriseBooking earlier{0,0,0,22000,22100,2,L"confirmed"};
+    assert(db.applySyncedBooking(L"linux",6,L"room:shared",earlier,L"",L"sync-test"));
+    bool snapshotChanged=false;
+    const std::wstring reordered=L"[{\"clientId\":\"other\",\"bookingId\":7,\"roomKey\":\"room:shared\",\"startsAt\":22000,\"endsAt\":22100,\"attendees\":2},{\"clientId\":\"linux\",\"bookingId\":6,\"roomKey\":\"room:shared\",\"startsAt\":23000,\"endsAt\":23100,\"attendees\":2}]";
+    assert(db.applySyncedBookingSnapshot(reordered,L"this-device",snapshotChanged) && snapshotChanged);
+    assert(db.activeBookingForRoom(roomId,22050,active) && active.userId==0);
+    assert(db.activeBookingForRoom(roomId,23050,active) && active.userId==0);
+    assert(db.applySyncedBookingSnapshot(reordered,L"this-device",snapshotChanged) && !snapshotChanged);
+    const std::wstring conflicting=L"[{\"clientId\":\"linux\",\"bookingId\":6,\"roomKey\":\"room:shared\",\"startsAt\":24000,\"endsAt\":24100},{\"clientId\":\"other\",\"bookingId\":8,\"roomKey\":\"room:shared\",\"startsAt\":400,\"endsAt\":450}]";
+    assert(!db.applySyncedBookingSnapshot(conflicting,L"this-device",snapshotChanged));
+    assert(db.activeBookingForRoom(roomId,23050,active));assert(!db.activeBookingForRoom(roomId,24050,active));
+    assert(!db.applySyncedBookingSnapshot(L"[{},{ }]",L"this-device",snapshotChanged));
+    // The booking client ID identifies its origin, not the actor making the
+    // latest change. Reconcile own bookings only against a confirmed baseline.
+    auto ownSnapshot=[&](int64_t start,int64_t end,const std::wstring& state){return L"[{\"clientId\":\"this-device\",\"bookingId\":"+std::to_wstring(movableBooking)+L",\"roomKey\":\"room:shared\",\"startsAt\":"+std::to_wstring(start)+L",\"endsAt\":"+std::to_wstring(end)+L",\"status\":\""+state+L"\"}]";};
+    assert(db.applySyncedBookingSnapshot(ownSnapshot(400,500,L"confirmed"),L"this-device",snapshotChanged));
+    const std::wstring movedWithReuse=L"[{\"clientId\":\"linux-other\",\"bookingId\":9,\"roomKey\":\"room:shared\",\"startsAt\":400,\"endsAt\":500},"+ownSnapshot(25000,25100,L"confirmed").substr(1);
+    assert(sqlite3_open("KR_BUILD/test-enterprise.db",&remoteFault)==SQLITE_OK);
+    assert(sqlite3_exec(remoteFault,"CREATE TRIGGER fail_own_booking_audit BEFORE INSERT ON audit_log WHEN NEW.action='sync.booking.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedBookingSnapshot(movedWithReuse,L"this-device",snapshotChanged));
+    assert(db.activeBookingForRoom(roomId,450,active) && active.id==movableBooking);
+    assert(sqlite3_exec(remoteFault,"DROP TRIGGER fail_own_booking_audit",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(remoteFault);
+    assert(db.applySyncedBookingSnapshot(movedWithReuse,L"this-device",snapshotChanged) && snapshotChanged);
+    assert(db.activeBookingForRoom(roomId,450,active) && active.userId==0);
+    assert(db.activeBookingForRoom(roomId,25050,active) && active.id==movableBooking && active.userId==1 && active.attendees==4);
+    assert(db.rescheduleBooking({movableBooking,roomId,1,26000,26100,4,L"confirmed"},L"test"));
+    assert(!db.applySyncedBookingSnapshot(ownSnapshot(27000,27100,L"confirmed"),L"this-device",snapshotChanged));
+    assert(db.activeBookingForRoom(roomId,26050,active) && active.id==movableBooking);
+    assert(db.applySyncedBookingSnapshot(ownSnapshot(26000,26100,L"confirmed"),L"this-device",snapshotChanged));
+    assert(db.applySyncedBookingSnapshot(ownSnapshot(26000,26100,L"cancelled"),L"this-device",snapshotChanged));
+    assert(!db.activeBookingForRoom(roomId,26050,active));
     assert(db.archiveRoom(roomId, L"test"));
     assert(db.rooms().empty());
     int64_t projectId = 0;
@@ -93,7 +153,19 @@ int main() {
     assert(db.leaveRequests(requesterId).front().status == L"approved");
     assert(db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"pending", 0, true}, L"sync-test"));
     assert(db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"approved", approverIdEmployee, true}, L"sync-test"));
+    // A stale pending replay cannot undo a local decision; a contradictory
+    // decision must stop the cursor instead of silently overwriting it.
+    assert(db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"pending", 0, true}, L"sync-test"));
+    assert(!db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3000, 4000, L"Remote Erholung", L"rejected", approverIdEmployee, true}, L"sync-test"));
+    assert(!db.applySyncedLeaveRequest(L"remote-device:leave-2", {0, requesterId, 3001, 4000, L"Remote Erholung", L"approved", approverIdEmployee, true}, L"sync-test"));
     bool syncedLeaveApproved=false;for(const EnterpriseLeaveRequest& leave:db.leaveRequests(requesterId,true))if(leave.reason==L"Remote Erholung"&&leave.status==L"approved"&&leave.decidedBy==approverIdEmployee)syncedLeaveApproved=true;assert(syncedLeaveApproved);
+    // A decision received for a request created by this desktop must update
+    // the existing request rather than creating a duplicate.
+    int64_t ownRequest=0;
+    assert(db.createLeaveRequest({0, requesterId, 6000, 7000, L"Eigener Antrag", L"pending", 0, true}, ownRequest, L"test"));
+    assert(db.ensureSyncedExternalId(L"leave",ownRequest,L"this-desktop:leave-3"));
+    assert(db.applySyncedLeaveRequest(L"this-desktop:leave-3", {0, requesterId, 6000, 7000, L"Eigener Antrag", L"rejected", approverIdEmployee, true}, L"sync-test"));
+    int ownCount=0;for(const auto& item:db.leaveRequests(requesterId,true))if(item.reason==L"Eigener Antrag"){++ownCount;assert(item.id==ownRequest&&item.status==L"rejected"&&item.decidedBy==approverIdEmployee);}assert(ownCount==1);
     // A mobile identity can arrive before an employee master-data event. The
     // request must still be retained and become visible to approvers.
     assert(db.applySyncedLeaveRequest(L"mobile-device:leave-9001", {0, 9001, 5000, 6000, L"Mobile Antrag", L"pending", 0, true}, L"sync-test"));
@@ -122,18 +194,75 @@ int main() {
     assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe",L"Operations",L"Mittel",L"open",requesterId,true}, L"sync-test"));
     assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"in_progress",requesterId,true}, L"sync-test"));
     bool syncedTaskUpdated=false;for(const EnterpriseTask& task:db.tasks())if(task.title==L"Remote Aufgabe aktualisiert"&&task.status==L"in_progress")syncedTaskUpdated=true;assert(syncedTaskUpdated);
+    // New event payloads carry schedule; legacy payloads must preserve it.
+    assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"in_progress",requesterId,true,1900000000,7}, L"sync-test",true));
+    assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"in_progress",requesterId,true}, L"sync-test"));
+    bool schedulePreserved=false;for(const EnterpriseTask& task:db.tasks())if(task.title==L"Remote Aufgabe aktualisiert"&&task.dueAt==1900000000&&task.recurrenceDays==7)schedulePreserved=true;assert(schedulePreserved);
+    assert(!db.applySyncedTask(L"remote-device:task-5", {0,L"Ungültige Änderung",L"Operations",L"Hoch",L"in_progress",requesterId,true,1900000000,3661}, L"sync-test",true));
+    bool invalidRolledBack=false;for(const EnterpriseTask& task:db.tasks())if(task.title==L"Remote Aufgabe aktualisiert"&&task.recurrenceDays==7)invalidRolledBack=true;assert(invalidRolledBack);
+    sqlite3* faultDb=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&faultDb)==SQLITE_OK);
+    assert(sqlite3_exec(faultDb,"CREATE TRIGGER fail_synced_schedule BEFORE INSERT ON audit_log WHEN NEW.action='sync.task.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedTask(L"remote-device:task-5", {0,L"Darf nicht gespeichert werden",L"Operations",L"Hoch",L"in_progress",requesterId,true,2000000000,9}, L"sync-test",true));
+    assert(sqlite3_exec(faultDb,"DROP TRIGGER fail_synced_schedule",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(faultDb);
+    bool atomicSchedule=false;for(const EnterpriseTask& task:db.tasks())if(task.title==L"Remote Aufgabe aktualisiert"&&task.dueAt==1900000000&&task.recurrenceDays==7)atomicSchedule=true;assert(atomicSchedule);
+    assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"in_progress",requesterId,true,0,0}, L"sync-test",true));
+    bool scheduleCleared=false;for(const EnterpriseTask& task:db.tasks())if(task.title==L"Remote Aufgabe aktualisiert"&&task.dueAt==0&&task.recurrenceDays==0)scheduleCleared=true;assert(scheduleCleared);
+
     assert(db.applySyncedEmployee(L"remote-device:employee-requester", {0,L"Remote Antrag",L"Engineer",L"Operations",L"office",true}, L"sync-test"));
     assert(db.applySyncedEmployee(L"remote-device:employee-approver", {0,L"Remote Freigabe",L"Manager",L"Operations",L"office",true}, L"sync-test"));
     assert(db.applySyncedTaskApproval(L"remote-device:approval-5",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"",{0,0,0,0,L"pending",0,true},L"sync-test"));
     assert(db.applySyncedTaskApproval(L"remote-device:approval-5",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"remote-device:employee-approver",{0,0,0,0,L"approved",0,true},L"sync-test"));
+    // A replayed older request must not reopen an already decided approval.
+    assert(db.applySyncedTaskApproval(L"remote-device:approval-5",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"",{0,0,0,0,L"pending",0,true},L"sync-test"));
+    assert(!db.applySyncedTaskApproval(L"remote-device:approval-5",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"remote-device:employee-approver",{0,0,0,0,L"rejected",0,true},L"sync-test"));
+    assert(!db.applySyncedTaskApproval(L"remote-device:approval-5",L"remote-device:task-5",L"remote-device:employee-approver",L"remote-device:employee-requester",L"",{0,0,0,0,L"pending",0,true},L"sync-test"));
+    sqlite3* approvalFault=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&approvalFault)==SQLITE_OK);
+    assert(sqlite3_exec(approvalFault,"CREATE TRIGGER fail_approval_sync_audit BEFORE INSERT ON audit_log WHEN NEW.action='sync.task_approval.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedTaskApproval(L"remote-device:approval-failed",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"",{0,0,0,0,L"pending",0,true},L"sync-test"));
+    assert(db.syncedLocalId(L"task_approval",L"remote-device:approval-failed")==0);
+    assert(sqlite3_exec(approvalFault,"DROP TRIGGER fail_approval_sync_audit",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(approvalFault);
+    int64_t ownApproval=0;
+    assert(db.createTaskApproval(db.syncedLocalId(L"task",L"remote-device:task-5"),db.syncedLocalId(L"employee",L"remote-device:employee-requester"),db.syncedLocalId(L"employee",L"remote-device:employee-approver"),ownApproval,L"sync-test"));
+    assert(db.ensureSyncedExternalId(L"task_approval",ownApproval,L"local-device:approval-own"));
+    assert(db.applySyncedTaskApproval(L"local-device:approval-own",L"remote-device:task-5",L"remote-device:employee-requester",L"remote-device:employee-approver",L"remote-device:employee-approver",{0,0,0,0,L"approved",0,true},L"sync-test"));
+    bool ownDecision=false;for(const auto& approval:db.taskApprovals(0,true))if(approval.id==ownApproval&&approval.status==L"approved")ownDecision=true;assert(ownDecision);
     bool syncedApproval=false;for(const EnterpriseTaskApproval& approval:db.taskApprovals(0,true))if(approval.status==L"approved"&&approval.decidedBy>0)syncedApproval=true;assert(syncedApproval);
     assert(db.applySyncedComment(L"remote-device:comment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Synchronisierter Aufgabenkommentar",L""},L"sync-test"));
+    assert(db.applySyncedComment(L"remote-device:comment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Synchronisierter Aufgabenkommentar",L""},L"sync-test"));
+    assert(!db.applySyncedComment(L"remote-device:comment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Abweichender Kommentar",L""},L"sync-test"));
+    assert(!db.applySyncedComment(L"remote-device:comment-5",L"remote-device:task-5",L"remote-device:employee-approver",{0,L"task",0,0,L"Synchronisierter Aufgabenkommentar",L""},L"sync-test"));
+    assert(db.applySyncedComment(L"remote-device:dated-comment",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Historischer Kommentar",L"2024-02-03T12:34:56Z"},L"sync-test"));
+    bool datedComment=false;for(const auto& c:db.commentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))if(c.body==L"Historischer Kommentar")datedComment=c.createdAt==L"2024-02-03T12:34:56Z";assert(datedComment);
+    assert(!db.applySyncedComment(L"remote-device:invalid-date",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Ungültig",L"not-a-date"},L"sync-test"));
+    assert(db.syncedLocalId(L"comment",L"remote-device:invalid-date")==0);
+    sqlite3* commentFault=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&commentFault)==SQLITE_OK);
+    assert(sqlite3_exec(commentFault,"CREATE TRIGGER fail_comment_audit BEFORE INSERT ON audit_log WHEN NEW.action='sync.comment.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedComment(L"remote-device:comment-failed",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,0,L"Nicht gespeichert",L""},L"sync-test"));
+    assert(db.syncedLocalId(L"comment",L"remote-device:comment-failed")==0);
+    assert(sqlite3_exec(commentFault,"DROP TRIGGER fail_comment_audit",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(commentFault);
     bool syncedComment=false;for(const EnterpriseComment& comment:db.commentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))if(comment.body==L"Synchronisierter Aufgabenkommentar")syncedComment=true;assert(syncedComment);
     const std::wstring remoteAttachmentHash=L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     assert(db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"remote-evidence.pdf",L"H:\\Aurora_Workspace\\KR_BUILD\\attachments\\task\\remote_evidence",512,remoteAttachmentHash,0,L"",true},L"sync-test"));
     bool syncedAttachment=false;for(const EnterpriseAttachment& attachment:db.attachmentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))if(attachment.originalName==L"remote-evidence.pdf"&&attachment.sha256==remoteAttachmentHash)syncedAttachment=true;assert(syncedAttachment);
     assert(db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"remote-evidence.pdf",L"H:\\Aurora_Workspace\\KR_BUILD\\attachments\\task\\remote_evidence",512,remoteAttachmentHash,0,L"",false},L"sync-test"));
     for(const EnterpriseAttachment& attachment:db.attachmentsFor(L"task",db.syncedLocalId(L"task",L"remote-device:task-5")))assert(attachment.originalName!=L"remote-evidence.pdf");
+    const auto subject=db.syncedLocalId(L"task",L"remote-device:task-5");
+    assert(db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"remote-evidence.pdf",L"/another/path",512,remoteAttachmentHash,0,L"",true},L"sync-test"));
+    auto restoredAttachments=db.attachmentsFor(L"task",subject);bool preservedPath=false;
+    for(const auto& a:restoredAttachments)if(a.originalName==L"remote-evidence.pdf")preservedPath=a.storedPath==L"H:\\Aurora_Workspace\\KR_BUILD\\attachments\\task\\remote_evidence";
+    assert(preservedPath);
+    assert(!db.applySyncedAttachment(L"remote-device:attachment-5",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"changed.pdf",L"/another/path",512,remoteAttachmentHash,0,L"",false},L"sync-test"));
+    restoredAttachments=db.attachmentsFor(L"task",subject);assert(restoredAttachments.size()==1&&restoredAttachments[0].originalName==L"remote-evidence.pdf");
+    int64_t ownAttachment=0;
+    assert(db.createAttachment({0,L"task",subject,L"own.pdf",L"/local/own.pdf",512,remoteAttachmentHash,db.syncedLocalId(L"employee",L"remote-device:employee-requester"),L"",true},ownAttachment,L"test"));
+    assert(db.ensureSyncedExternalId(L"attachment",ownAttachment,L"local-device:attachment-own"));
+    assert(db.applySyncedAttachment(L"local-device:attachment-own",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"own.pdf",L"/remote/path",512,remoteAttachmentHash,0,L"",false},L"sync-test"));
+    assert(db.applySyncedAttachment(L"local-device:attachment-own",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"own.pdf",L"/remote/path",512,remoteAttachmentHash,0,L"",true},L"sync-test"));
+    bool attachmentChanged=true;
+    assert(db.applySyncedAttachment(L"local-device:attachment-own",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"own.pdf",L"/remote/path",512,remoteAttachmentHash,0,L"",true},L"sync-test",&attachmentChanged));assert(!attachmentChanged);
+    assert(db.applySyncedAttachment(L"local-device:attachment-own",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"own.pdf",L"/remote/path",512,remoteAttachmentHash,0,L"",false},L"sync-test",&attachmentChanged));assert(attachmentChanged);
+    assert(db.applySyncedAttachment(L"local-device:attachment-own",L"remote-device:task-5",L"remote-device:employee-requester",{0,L"task",0,L"own.pdf",L"/remote/path",512,remoteAttachmentHash,0,L"",true},L"sync-test"));
+    bool ownPath=false;for(const auto& a:db.attachmentsFor(L"task",subject))if(a.id==ownAttachment)ownPath=a.storedPath==L"/local/own.pdf";assert(ownPath);
     assert(db.applySyncedTask(L"remote-device:task-5", {0,L"Remote Aufgabe aktualisiert",L"Operations",L"Hoch",L"cancelled",requesterId,false}, L"sync-test"));
     assert(db.tasks().front().dueAt == 20000 && db.tasks().front().recurrenceDays == 14);
     assert(db.updateTask({taskId, L"Integration und Lasttest", L"Engineering", L"Kritisch", L"open", requesterId, true, 25000, 7}, L"test"));
@@ -159,7 +288,9 @@ int main() {
     int64_t subtaskId = 0;
     assert(db.createSubtask({0, taskId, L"Lasttest-Protokoll vorbereiten", L"open", requesterId, 24500, true}, subtaskId, L"test"));
     assert(db.subtasks(taskId).size() == 1);
-    assert(!db.updateTaskStatus(taskId, L"done", L"test"));
+    int64_t reportedRepeat = -1;
+    assert(!db.updateTaskStatus(taskId, L"done", L"test", &reportedRepeat));
+    assert(reportedRepeat == 0);
     assert(db.updateSubtask({subtaskId, taskId, L"Lasttest-Protokoll finalisieren", L"in_progress", approverIdEmployee, 24600, true}, L"test"));
     assert(db.updateSubtaskStatus(subtaskId, L"done", L"test"));
     int64_t dependentTaskId = 0;
@@ -168,20 +299,151 @@ int main() {
     assert(db.taskDependencies(dependentTaskId).size() == 1);
     assert(!db.addTaskDependency(taskId, dependentTaskId, L"test"));
     assert(!db.updateTaskStatus(dependentTaskId, L"done", L"test"));
-    assert(db.updateTaskStatus(taskId, L"done", L"test"));
+    assert(db.updateTaskStatus(taskId, L"done", L"test", &reportedRepeat));
     int64_t recurringTaskId = 0;
     bool originalCompleted = false, recurringCreated = false;
     for (const EnterpriseTask& task : db.tasks()) {
         if (task.id == taskId && task.status == L"done") originalCompleted = true;
         if (task.id != taskId && task.title == L"Integration und Lasttest" && task.status == L"open" && task.dueAt == 25000 + 7 * 86400 && task.recurrenceDays == 7) { recurringCreated = true; recurringTaskId = task.id; }
     }
-    assert(originalCompleted && recurringCreated);
+    assert(originalCompleted && recurringCreated && reportedRepeat == recurringTaskId);
     assert(db.tasksForProject(linkedProject).size() == 2);
     const std::vector<EnterpriseSubtask> recurringSubtasks = db.subtasks(recurringTaskId);
     assert(recurringSubtasks.size() == 1 && recurringSubtasks.front().title == L"Lasttest-Protokoll finalisieren" && recurringSubtasks.front().status == L"open" && recurringSubtasks.front().dueAt == 24600 + 7 * 86400);
     assert(db.updateTaskStatus(dependentTaskId, L"done", L"test"));
     assert(db.removeTaskDependency(dependentTaskId, taskId, L"test"));
     assert(db.taskDependencies(dependentTaskId).empty());
+    // Incoming cross-device prerequisites use shared task IDs and refuse to
+    // overwrite local divergence or create invalid task graphs.
+    int64_t syncTask=0,syncPrerequisite=0,syncCompleted=0;
+    assert(db.createTask({0,L"Sync Hauptaufgabe",L"IT",L"Mittel",L"open",requesterId,true},syncTask,L"test"));
+    assert(db.createTask({0,L"Sync Voraussetzung",L"IT",L"Mittel",L"open",requesterId,true},syncPrerequisite,L"test"));
+    assert(db.createTask({0,L"Sync abgeschlossen",L"IT",L"Mittel",L"open",requesterId,true},syncCompleted,L"test"));
+    assert(db.ensureSyncedExternalId(L"task",syncTask,L"remote:task:a"));
+    assert(db.ensureSyncedExternalId(L"task",syncPrerequisite,L"remote:task:b"));
+    assert(db.ensureSyncedExternalId(L"task",syncCompleted,L"remote:task:c"));
+    assert(db.ensureSyncedExternalId(L"project",linkedProject,L"remote:project:p"));
+    const size_t assignmentsBefore=db.tasksForProject(linkedProject).size();
+    assert(!db.applySyncedProjectAssignment(L"missing",L"remote:task:a",true,L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",true,L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",true,L"sync-test"));
+    assert(db.tasksForProject(linkedProject).size()==assignmentsBefore+1);
+    assert(db.setTaskProject(syncTask,0,L"test"));
+    assert(!db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",false,L"sync-test"));
+    assert(db.assignTaskToProject(syncTask,linkedProject,L"test"));
+    assert(db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",false,L"sync-test"));
+    assert(db.assignTaskToProject(syncTask,linkedProject,L"test"));
+    assert(!db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",true,L"sync-test"));
+    assert(db.setTaskProject(syncTask,0,L"test"));
+    sqlite3* projectFault=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&projectFault)==SQLITE_OK);
+    assert(sqlite3_exec(projectFault,"CREATE TRIGGER fail_project_assignment_audit BEFORE INSERT ON audit_log WHEN NEW.action='sync.project_assignment.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedProjectAssignment(L"remote:project:p",L"remote:task:a",true,L"sync-test"));
+    assert(db.tasksForProject(linkedProject).size()==assignmentsBefore);
+    assert(sqlite3_exec(projectFault,"DROP TRIGGER fail_project_assignment_audit",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(projectFault);
+
+    // Replay the desktop event sequence emitted by central task creation and
+    // a later atomic move, including duplicate delivery after reconnect.
+    assert(db.applySyncedProject(L"central:p-one",{0,L"Projekt Eins",L"IT",L"",L"planned",requesterId,true},L"sync-test"));
+    assert(db.applySyncedProject(L"central:p-two",{0,L"Projekt Zwei",L"IT",L"",L"planned",requesterId,true},L"sync-test"));
+    const auto pOne=db.syncedLocalId(L"project",L"central:p-one"),pTwo=db.syncedLocalId(L"project",L"central:p-two");
+    assert(db.applySyncedTask(L"central:task",{0,L"Zentral",L"IT",L"Mittel",L"open",requesterId,true},L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"central:p-one",L"central:task",true,L"sync-test"));
+    assert(db.tasksForProject(pOne).size()==1 && db.tasksForProject(pTwo).empty());
+    assert(db.applySyncedTask(L"central:task",{0,L"Zentral geändert",L"IT",L"Hoch",L"open",requesterId,true},L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"central:p-one",L"central:task",false,L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"central:p-two",L"central:task",true,L"sync-test"));
+    assert(db.applySyncedProjectAssignment(L"central:p-two",L"central:task",true,L"sync-test"));
+    assert(db.tasksForProject(pOne).empty() && db.tasksForProject(pTwo).size()==1 && db.tasksForProject(pTwo)[0].title==L"Zentral geändert");
+    assert(db.applySyncedTask(L"central:task",{0,L"Zentral geändert",L"IT",L"Hoch",L"open",requesterId,false},L"sync-test"));
+    assert(db.archiveProject(pOne,L"test") && db.archiveProject(pTwo,L"test"));
+
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",true,L"sync-test"));
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",true,L"sync-test"));
+    assert(!db.applySyncedTaskDependency(L"remote:task:b",L"remote:task:a",true,L"sync-test"));
+    assert(!db.updateTaskStatus(syncTask,L"done",L"test"));
+    assert(db.updateTaskStatus(syncCompleted,L"done",L"test"));
+    assert(!db.applySyncedTaskDependency(L"remote:task:c",L"remote:task:b",true,L"sync-test"));
+    assert(db.removeTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(!db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",false,L"sync-test"));
+    assert(db.addTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",false,L"sync-test"));
+    assert(db.taskDependencies(syncTask).empty());
+    assert(!db.applySyncedTaskDependency(L"missing",L"remote:task:b",true,L"sync-test"));
+    int64_t syncUntracked=0;
+    assert(db.createTask({0,L"Nicht abgeglichene Aufgabe",L"IT",L"Mittel",L"open",requesterId,true},syncUntracked,L"test"));
+    assert(db.ensureSyncedExternalId(L"task",syncUntracked,L"remote:task:d"));
+    assert(db.addTaskDependency(syncUntracked,syncPrerequisite,L"test"));
+    assert(!db.applySyncedTaskDependency(L"remote:task:d",L"remote:task:b",true,L"sync-test"));
+    assert(db.removeTaskDependency(syncUntracked,syncPrerequisite,L"test"));
+    sqlite3* dependencyFaultDb=nullptr;assert(sqlite3_open("KR_BUILD/test-enterprise.db",&dependencyFaultDb)==SQLITE_OK);
+    assert(sqlite3_exec(dependencyFaultDb,"CREATE TRIGGER fail_dependency_sync BEFORE INSERT ON audit_log WHEN NEW.action='sync.task_dependency.applied' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.applySyncedTaskDependency(L"remote:task:d",L"remote:task:b",true,L"sync-test"));
+    assert(db.taskDependencies(syncUntracked).empty());
+    assert(sqlite3_exec(dependencyFaultDb,"DROP TRIGGER fail_dependency_sync",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(dependencyFaultDb);
+    assert(db.applySyncedTaskDependency(L"remote:task:d",L"remote:task:b",true,L"sync-test"));
+    // Durable outgoing dependency changes survive retries and failed acknowledgements.
+    // A locally deleted previously imported edge must be queued during setup,
+    // before a later incoming event can recreate it.
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",true,L"sync-test"));
+    assert(db.removeTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(db.configureDesktopDependencyOutbox(L"desktop-test"));
+    assert(!db.configureDesktopDependencyOutbox(L"other-client"));
+    std::wstring depOperation,depWire; int64_t depTask=0,depPrerequisite=0; bool depPresent=false,depExpected=false;
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(!depOperation.empty() && depTask==syncTask && depPrerequisite==syncPrerequisite && !depPresent && depExpected);
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",true,L"sync-test"));
+    assert(db.taskDependencies(syncTask).empty());
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:a\",\"dependencyId\":\"remote:task:b\",\"present\":false,\"expected\":true}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.addTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(!depOperation.empty() && depTask==syncTask && depPrerequisite==syncPrerequisite && depPresent && !depExpected && depWire.empty());
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:a\",\"dependencyId\":\"remote:task:b\",\"present\":true,\"expected\":false}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(!db.freezeDesktopDependencyOperation(depOperation,L"http://other",1,depWire));
+    assert(db.applySyncedTaskDependency(L"remote:task:a",L"remote:task:b",true,L"sync-test"));
+    assert(sqlite3_open("KR_BUILD/test-enterprise.db",&dependencyFaultDb)==SQLITE_OK);
+    assert(sqlite3_exec(dependencyFaultDb,"CREATE TRIGGER fail_dependency_sent BEFORE INSERT ON audit_log WHEN NEW.action='sync.task_dependency.sent' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    assert(!db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(sqlite3_exec(dependencyFaultDb,"DROP TRIGGER fail_dependency_sent",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(dependencyFaultDb);
+    std::wstring depRetry,depRetryWire; int64_t retryTask=0,retryPrerequisite=0; bool retryPresent=false,retryExpected=false;
+    assert(db.nextDesktopDependencyOperation(depRetry,retryTask,retryPrerequisite,retryPresent,retryExpected,depRetryWire));
+    assert(depRetry==depOperation && depRetryWire==depWire);
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.removeTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(!depOperation.empty() && !depPresent && depExpected && depWire.empty());
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:a\",\"dependencyId\":\"remote:task:b\",\"present\":false,\"expected\":true}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire) && depOperation.empty());
+    // An unmapped task must not prevent an independent mapped edge from being sent.
+    int64_t waitingTask=0;
+    assert(db.createTask({0,L"Noch nicht zugeordnet",L"IT",L"Mittel",L"open",requesterId,true},waitingTask,L"test"));
+    assert(db.addTaskDependency(waitingTask,syncPrerequisite,L"test"));
+    assert(db.removeTaskDependency(waitingTask,syncPrerequisite,L"test"));
+    assert(db.addTaskDependency(syncTask,syncPrerequisite,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(depTask==syncTask && depPresent && !depExpected);
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:a\",\"dependencyId\":\"remote:task:b\",\"present\":true,\"expected\":false}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(depTask==waitingTask && depPresent && !depExpected);
+    assert(db.ensureSyncedExternalId(L"task",waitingTask,L"remote:task:waiting"));
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:waiting\",\"dependencyId\":\"remote:task:b\",\"present\":true,\"expected\":false}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire));
+    assert(depTask==waitingTask && !depPresent && depExpected);
+    depWire=L"{\"clientId\":\"desktop-test\",\"operationId\":\""+depOperation+L"\",\"taskId\":\"remote:task:waiting\",\"dependencyId\":\"remote:task:b\",\"present\":false,\"expected\":true}";
+    assert(db.freezeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire));
+    assert(db.acknowledgeDesktopDependencyOperation(depOperation,L"http://localhost:8080",1,depWire,L"test"));
+    assert(db.nextDesktopDependencyOperation(depOperation,depTask,depPrerequisite,depPresent,depExpected,depWire) && depOperation.empty());
+    assert(db.archiveTask(waitingTask,L"test"));
+    assert(db.archiveTask(syncTask,L"test"));assert(db.archiveTask(syncPrerequisite,L"test"));
+    assert(db.archiveTask(syncCompleted,L"test"));assert(db.archiveTask(syncUntracked,L"test"));
     int64_t approvalId = 0;
     assert(!db.createTaskApproval(taskId, requesterId, requesterId, approvalId, L"test"));
     assert(db.createTaskApproval(taskId, requesterId, approverIdEmployee, approvalId, L"test"));
@@ -235,6 +497,9 @@ int main() {
     bool recurringMaintenanceCreated = false;
     for (const EnterpriseMaintenanceOrder& order : db.maintenanceOrders(assetId)) if (order.id != maintenanceOrderId && order.title == L"Lampenlaufzeit und Filter prüfen" && order.status == L"open" && order.dueAt == 31000 + 90 * 86400 && order.recurrenceDays == 90) { recurringMaintenanceCreated = true; recurringMaintenanceOrderId = order.id; }
     assert(recurringMaintenanceCreated);
+    assert(db.updateMaintenanceOrderStatus(maintenanceOrderId,L"open",L"test"));
+    assert(db.updateMaintenanceOrderStatus(maintenanceOrderId,L"completed",L"test"));
+    assert(db.maintenanceOrders(assetId).size()==2);
     assert(db.archiveMaintenanceOrder(maintenanceOrderId, L"test"));
     assert(db.archiveMaintenanceOrder(recurringMaintenanceOrderId, L"test"));
     assert(db.maintenanceOrders(assetId).empty());
@@ -289,5 +554,143 @@ int main() {
     bool auditActorApplied = false;
     for (const std::wstring& entry : db.auditLog()) if (entry.find(L"session-user") != std::wstring::npos) auditActorApplied = true;
     assert(auditActorApplied);
+    // Durable desktop project moves keep remove-before-add order and preserve
+    // a frozen request across an acknowledgement failure.
+    {
+        const std::wstring assignmentPath=L"KR_BUILD/project-outbox.db";std::filesystem::remove(assignmentPath);
+        EnterpriseDatabase d(assignmentPath);assert(d.ready());int64_t p1=0,p2=0,t=0;
+        assert(d.createProject({0,L"Erstes Projekt",L"IT",L"",L"active",1,true},p1,L"test"));
+        assert(d.createProject({0,L"Zweites Projekt",L"IT",L"",L"active",1,true},p2,L"test"));
+        assert(d.createTask({0,L"Zuordnung",L"IT",L"Mittel",L"open",1,true},t,L"test"));
+        assert(d.ensureSyncedExternalId(L"project",p1,L"p:1")&&d.ensureSyncedExternalId(L"project",p2,L"p:2")&&d.ensureSyncedExternalId(L"task",t,L"t:1"));
+        assert(d.assignTaskToProject(t,p1,L"test"));assert(d.configureDesktopProjectAssignmentOutbox(L"windows"));
+        std::wstring op,wire;int64_t project=0,task=0;bool present=false,expected=false;
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire));
+        assert(!op.empty()&&project==p1&&task==t&&present&&!expected&&wire.empty());
+        auto encodeAssignment=[&](const wchar_t* key,bool yes,bool base){return L"{\"clientId\":\"windows\",\"operationId\":\""+op+L"\",\"projectId\":\""+key+L"\",\"taskId\":\"t:1\",\"present\":"+(yes?L"true":L"false")+L",\"expected\":"+(base?L"true":L"false")+L"}";};
+        wire=encodeAssignment(L"p:1",true,false);assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));
+        sqlite3* fault=nullptr;assert(sqlite3_open("KR_BUILD/project-outbox.db",&fault)==SQLITE_OK);
+        assert(sqlite3_exec(fault,"CREATE TRIGGER fail_assignment_sent BEFORE INSERT ON audit_log WHEN NEW.action='sync.project_assignment.sent' BEGIN SELECT RAISE(ABORT,'audit failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+        assert(!d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(sqlite3_exec(fault,"DROP TRIGGER fail_assignment_sent",nullptr,nullptr,nullptr)==SQLITE_OK);sqlite3_close(fault);
+        std::wstring retry,retryWire;int64_t rp=0,rt=0;bool ry=false,rb=false;
+        assert(d.nextDesktopProjectAssignmentOperation(retry,rp,rt,ry,rb,retryWire)&&retry==op&&retryWire==wire);
+        assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.setTaskProject(t,p2,L"test"));
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire)&&project==p1&&!present&&expected);
+        assert(d.applySyncedProjectAssignment(L"p:1",L"t:1",true,L"remote"));assert(d.tasksForProject(p1).empty());
+        wire=encodeAssignment(L"p:1",false,true);assert(!d.freezeDesktopProjectAssignmentOperation(op,L"https://other",9,wire));
+        assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire)&&project==p2&&present&&!expected);
+        wire=encodeAssignment(L"p:2",true,false);assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.applySyncedProjectAssignment(L"p:2",L"t:1",false,L"remote"));assert(d.tasksForProject(p2).empty());
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire)&&op.empty());
+        bool snapshotChanged=false;
+        const std::wstring assignmentSnapshot=L"[{\"projectId\":\"p:1\",\"taskId\":\"t:1\"}]";
+        assert(!d.applySyncedProjectAssignmentSnapshot(L"[{\"projectId\":\"p:1\",\"taskId\":\"t:1\"},{\"projectId\":\"missing\",\"taskId\":\"t:1\"}]",snapshotChanged));
+        assert(d.tasksForProject(p1).empty());
+        assert(d.applySyncedProjectAssignmentSnapshot(assignmentSnapshot,snapshotChanged)&&snapshotChanged);
+        assert(d.tasksForProject(p1).size()==1);
+        assert(d.applySyncedProjectAssignmentSnapshot(assignmentSnapshot,snapshotChanged)&&!snapshotChanged);
+        assert(!d.applySyncedProjectAssignmentSnapshot(L"[{\"projectId\":\"p:1\",\"taskId\":\"t:1\"},{\"projectId\":\"p:1\",\"taskId\":\"t:1\"}]",snapshotChanged));
+        assert(d.applySyncedProjectAssignmentSnapshot(L"[]",snapshotChanged)&&snapshotChanged&&d.tasksForProject(p1).empty());
+        assert(d.assignTaskToProject(t,p2,L"test"));
+        assert(d.applySyncedProjectAssignmentSnapshot(L"[]",snapshotChanged)&&d.tasksForProject(p2).size()==1);
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire)&&project==p2&&present&&!expected);
+    }
+    {
+        const std::wstring path=L"KR_BUILD/project-outbox-waiting.db";std::filesystem::remove(path);
+        EnterpriseDatabase d(path);assert(d.ready());int64_t p1=0,p2=0,waiting=0,ready=0;
+        assert(d.createProject({0,L"Ausstehendes Projekt",L"IT",L"",L"active",1,true},p1,L"test"));
+        assert(d.createProject({0,L"Bekanntes Projekt",L"IT",L"",L"active",1,true},p2,L"test"));
+        assert(d.createTask({0,L"Wartet",L"IT",L"Mittel",L"open",1,true},waiting,L"test"));
+        assert(d.createTask({0,L"Bereit",L"IT",L"Mittel",L"open",1,true},ready,L"test"));
+        assert(d.ensureSyncedExternalId(L"project",p2,L"p:ready"));
+        assert(d.ensureSyncedExternalId(L"task",waiting,L"t:waiting"));
+        assert(d.ensureSyncedExternalId(L"task",ready,L"t:ready"));
+        assert(d.configureDesktopProjectAssignmentOutbox(L"windows"));
+        assert(d.assignTaskToProject(waiting,p1,L"test"));
+        assert(d.setTaskProject(waiting,p2,L"test"));
+        assert(d.assignTaskToProject(ready,p2,L"test"));
+        std::wstring op,wire;int64_t project=0,task=0;bool present=false,expected=false;
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire));
+        assert(project==p2 && task==ready && present && !expected);
+        wire=L"{\"clientId\":\"windows\",\"operationId\":\""+op+L"\",\"projectId\":\"p:ready\",\"taskId\":\"t:ready\",\"present\":true,\"expected\":false}";
+        assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));
+        assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire));
+        assert(project==p1 && task==waiting && present && !expected);
+        assert(d.ensureSyncedExternalId(L"project",p1,L"p:waiting"));
+        wire=L"{\"clientId\":\"windows\",\"operationId\":\""+op+L"\",\"projectId\":\"p:waiting\",\"taskId\":\"t:waiting\",\"present\":true,\"expected\":false}";
+        assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));
+        assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire));
+        assert(project==p1 && task==waiting && !present && expected);
+        wire=L"{\"clientId\":\"windows\",\"operationId\":\""+op+L"\",\"projectId\":\"p:waiting\",\"taskId\":\"t:waiting\",\"present\":false,\"expected\":true}";
+        assert(d.freezeDesktopProjectAssignmentOperation(op,L"https://server",9,wire));
+        assert(d.acknowledgeDesktopProjectAssignmentOperation(op,L"https://server",9,wire,L"test"));
+        assert(d.nextDesktopProjectAssignmentOperation(op,project,task,present,expected,wire));
+        assert(project==p2 && task==waiting && present && !expected);
+    }
+    {
+        const std::wstring path=L"KR_BUILD/recurrence-overflow.db";std::filesystem::remove(path);
+        EnterpriseDatabase d(path);assert(d.ready());const auto maximum=std::numeric_limits<int64_t>::max();int64_t task=0,subtask=0,asset=0,order=0,next=0;
+        assert(d.createTask({0,L"Grenze Aufgabe",L"IT",L"Mittel",L"open",1,true,maximum,1},task,L"test"));
+        assert(!d.updateTaskStatus(task,L"done",L"test",&next)&&next==0);
+        assert(d.tasks().size()==1&&d.tasks()[0].status==L"open");
+        int64_t other=0;assert(d.createTask({0,L"Grenze Unteraufgabe",L"IT",L"Mittel",L"open",1,true,1900000000,1},other,L"test"));
+        assert(d.createSubtask({0,other,L"Unteraufgabe",L"done",1,maximum},subtask,L"test"));
+        assert(!d.updateTaskStatus(other,L"done",L"test",&next)&&next==0);
+        assert(d.tasks().size()==2);for(const auto& value:d.tasks())assert(value.status==L"open");
+        assert(d.createFacilityAsset({0,L"Grenze Anlage",L"Technik",L"IT",L"operational",true},asset,L"test"));
+        assert(d.createMaintenanceOrder({0,asset,L"Grenze Wartung",L"open",maximum,1,true},order,L"test"));
+        assert(!d.updateMaintenanceOrderStatus(order,L"completed",L"test"));
+        assert(d.maintenanceOrders(asset).size()==1&&d.maintenanceOrders(asset)[0].status==L"open");
+    }
+    {
+        const std::wstring path=L"KR_BUILD/recurrence-link.db";std::filesystem::remove(path);
+        EnterpriseDatabase d(path);assert(d.ready());int64_t source=0,successor=0,other=0;
+        assert(d.createTask({0,L"Quelle",L"IT",L"Mittel",L"open",1,true,1900000000,7},source,L"test"));
+        assert(d.createTask({0,L"Folge",L"IT",L"Mittel",L"open",1,true},successor,L"test"));
+        assert(d.createTask({0,L"Andere",L"IT",L"Mittel",L"open",1,true},other,L"test"));
+        assert(d.ensureSyncedExternalId(L"task",source,L"remote:source")&&d.ensureSyncedExternalId(L"task",successor,L"remote:successor")&&d.ensureSyncedExternalId(L"task",other,L"remote:other"));
+        assert(!d.applySyncedTaskRecurrence(L"remote:source",L"remote:missing",L"remote"));
+        bool changed=false;
+        assert(!d.applySyncedTaskRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"},{\"sourceId\":\"remote:other\",\"successorId\":\"missing\"}]",changed));
+        assert(d.applySyncedTaskRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"}]",changed)&&changed);
+        assert(d.applySyncedTaskRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"}]",changed)&&!changed);
+        assert(!d.applySyncedTaskRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:other\"}]",changed));
+        assert(d.applySyncedTaskRecurrence(L"remote:source",L"remote:successor",L"remote"));
+        assert(d.applySyncedTaskRecurrence(L"remote:source",L"remote:successor",L"remote"));
+        assert(!d.applySyncedTaskRecurrence(L"remote:source",L"remote:other",L"remote"));
+        std::vector<std::tuple<int64_t,std::wstring,std::wstring>> links;
+        assert(d.desktopTaskRecurrenceLinks(L"windows",L"https://server",9,links)&&links.size()==1);
+        assert(std::get<1>(links[0])==L"remote:source"&&std::get<2>(links[0])==L"remote:successor");
+        assert(!d.desktopTaskRecurrenceLinks(L"windows",L"https://other",9,links));
+        assert(!d.desktopTaskRecurrenceLinks(L"windows",L"https://server",10,links));
+        assert(d.desktopTaskRecurrenceLinks(L"windows",L"https://server",9,links)&&links.size()==1);
+        int64_t repeated=-1;assert(d.updateTaskStatus(source,L"done",L"test",&repeated)&&repeated==0&&d.tasks().size()==3);
+    }
+    {
+        const std::wstring path=L"KR_BUILD/maintenance-recurrence-link.db";std::filesystem::remove(path);
+        EnterpriseDatabase d(path); assert(d.ready());
+        int64_t asset=0,source=0,successor=0,other=0;
+        assert(d.createFacilityAsset({0,L"Anlage",L"Technik",L"IT",L"operational",true},asset,L"test"));
+        assert(d.createMaintenanceOrder({0,asset,L"Quelle",L"open",1900000000,7,true},source,L"test"));
+        assert(d.createMaintenanceOrder({0,asset,L"Folge",L"open",1900604800,7,true},successor,L"test"));
+        assert(d.createMaintenanceOrder({0,asset,L"Andere",L"open",1900604800,7,true},other,L"test"));
+        assert(d.ensureSyncedExternalId(L"maintenance_order",source,L"remote:source")&&d.ensureSyncedExternalId(L"maintenance_order",successor,L"remote:successor")&&d.ensureSyncedExternalId(L"maintenance_order",other,L"remote:other"));
+        assert(!d.applySyncedMaintenanceRecurrence(L"remote:source",L"remote:missing",L"remote"));
+        bool changed=false;
+        assert(!d.applySyncedMaintenanceRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"},{\"sourceId\":\"remote:other\",\"successorId\":\"missing\"}]",changed));
+        assert(d.applySyncedMaintenanceRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"}]",changed)&&changed);
+        assert(d.applySyncedMaintenanceRecurrenceSnapshot(L"[{\"sourceId\":\"remote:source\",\"successorId\":\"remote:successor\"}]",changed)&&!changed);
+        assert(!d.applySyncedMaintenanceRecurrence(L"remote:source",L"remote:other",L"remote"));
+        std::vector<std::tuple<int64_t,std::wstring,std::wstring>> links;
+        assert(d.desktopMaintenanceRecurrenceLinks(L"windows",L"https://server",9,links)&&links.size()==1);
+        assert(!d.desktopMaintenanceRecurrenceLinks(L"windows",L"https://other",9,links));
+        assert(d.updateMaintenanceOrderStatus(source,L"completed",L"test"));
+        assert(d.maintenanceOrders(asset).size()==3);
+    }
     std::cout << "enterprise database tests passed\n";
 }

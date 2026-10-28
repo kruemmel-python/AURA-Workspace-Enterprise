@@ -24,3 +24,23 @@
 | Auslieferung | EXE, Go-DLL, Synchronisationsserver und MinGW-Runtime-DLLs werden beim Build in einen Ordner gelegt; der Gesamtbuild erzeugt außerdem Linux-ELF, signierte Android-APK und ein SHA-256-Release-Manifest. | `build-enterprise.ps1 -SmokeTest` |
 
 Die zentrale Buchungskonfliktentscheidung ist über reservieren/commit/rollback abgesichert. Die Mehrclient-Regression prüft getrennte Client-IDs, Berechtigungen, Cursor-Replay, atomare Reservierungen und Konfliktfälle. Die Anhangsregression prüft zentralen SHA-256-Upload, erst danach erlaubte Metadatenreplikation, Zielclient-Projektion, Archivierung und bedarfsgesteuerten, erneut verifizierten Download in den Workspace.
+
+## Ubuntu: Abgleich mit den Windows-Arbeitsbereichen
+
+Die Linux-Oberfläche und der lokale Datenbankkern sind im Repository unter `clients/linux/` beschrieben. Die nachfolgenden Tests prüfen konkrete Abläufe; sie belegen noch keine vollständige Übereinstimmung aller Windows-Funktionen oder deren Windows-Laufzeit.
+
+| Arbeitsbereich | Ubuntu-Nachweis |
+| --- | --- |
+| Räume, CSV und Buchungen | `tests/linux_local_room_csv_gui_test.py`, `tests/linux_local_booking_test.py`, `tests/linux_booking_permissions_gui_test.py` |
+| Mitarbeiter, Präsenz und Urlaubsentscheidungen | `tests/linux_local_team_gui_test.py`, `tests/linux_local_leave_sync_gui_test.py` |
+| Aufgaben, Abhängigkeiten und Unteraufgaben | `tests/linux_local_task_details_gui_test.py`, `tests/linux_local_task_sync_integration.py` |
+| Projekte und Zuordnungen | `tests/linux_local_project_sync_integration.py`, `tests/linux_local_project_assignment_sync_integration.py` |
+| Tickets, Kommentare und Anhänge | `tests/linux_local_ticket_sync_integration.py`, `tests/linux_local_attachments_gui_test.py`, `tests/linux_collaborator_end_to_end_integration.py` |
+| Organisation und Freigaben | `tests/linux_local_organization_approval_gui_test.py`, `tests/linux_local_approval_sync_integration.py` |
+| Facility und Wartung | `tests/linux_local_facility_gui_test.py`, `tests/linux_local_facility_asset_sync_integration.py` |
+| Lokale Konten, Rollen und Administration | `tests/linux_local_accounts_gui_test.py`, `tests/linux_local_roles_gui_test.py` |
+| Linux-Verteilung und Server | `tests/linux_package_smoke_test.py`, `tests/linux_gui_integration.py` |
+
+Am 28.10.2026 wurden die lokalen GTK-Tests für Raum-CSV, Buchungsberechtigungen, Aufgabendetails, Mitarbeiter und Urlaub, Organisation und Freigaben, Facility und Wartung, Rollen und Konten unter Ubuntu erfolgreich ausgeführt. Der Pakettest prüfte außerdem einen isoliert gestarteten Linux-Server und Urlaubsentscheidungen mit zwei Konten. Diese Ergebnisse betreffen die jeweiligen Testszenarien und ersetzen keinen vollständigen Vergleich aller Plattformfunktionen.
+
+Die zentrale Ansicht besitzt noch keine vollständige Konten- und Rollenverwaltung, kein vollständiges Audit und keine Sicherung oder Wiederherstellung. Abgleich und Konfliktbehandlung besitzen bereichsspezifische Voraussetzungen und Grenzen; maßgeblich ist `clients/linux/README.md`. Ein vollständiger Laufzeitvergleich mit Windows und die abschließende Release-Prüfung stehen noch aus.

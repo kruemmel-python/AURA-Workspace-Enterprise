@@ -21,3 +21,7 @@ rules/target/
 *.suo
 Thumbs.db
 Desktop.ini
+
+# Python cache
+__pycache__/
+*.pyc

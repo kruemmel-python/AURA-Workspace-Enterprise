@@ -43,7 +43,7 @@ pub extern "C" fn aura_validate_workflow_transition(kind: *const c_char, from: *
             (b"cancelled", b"open")),
         b"ticket" => matches!((from, to),
             (b"open", b"in_progress") | (b"open", b"closed") |
-            (b"in_progress", b"resolved") | (b"in_progress", b"closed") |
+            (b"in_progress", b"resolved") | (b"in_progress", b"closed") | (b"in_progress", b"open") |
             (b"resolved", b"closed") | (b"resolved", b"in_progress") |
             (b"closed", b"open")),
         _ => false,

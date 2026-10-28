@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct EnterpriseRoom {
@@ -184,42 +185,70 @@ public:
     // Applies a central room projection using a stable remote-to-local mapping.
     // This never guesses by room name, so remote renames remain deterministic.
     bool applySyncedRoom(const std::wstring& externalId, const EnterpriseRoom& room, const std::wstring& actor);
-    bool createBooking(const EnterpriseBooking& booking, int64_t& newId, const std::wstring& actor);
-    bool createRecurringBookings(const EnterpriseBooking& firstBooking, int intervalDays, int occurrences, std::vector<int64_t>& newIds, const std::wstring& actor);
-    bool rescheduleBooking(const EnterpriseBooking& booking, const std::wstring& actor);
-    bool blockRoom(int64_t roomId, int64_t startUtc, int64_t endUtc, const std::wstring& reason, int64_t& newId, const std::wstring& actor);
-    bool cancelBooking(int64_t bookingId, const std::wstring& actor);
+    // Preserve a remote booking's identity separately from its local row ID.
+    bool applySyncedBooking(const std::wstring& clientId, int64_t remoteId, const std::wstring& roomExternalId, const EnterpriseBooking& booking, const std::wstring& reason, const std::wstring& actor, bool deferOverlapCheck = false);
+    bool applySyncedBookingSnapshot(const std::wstring& snapshotJson, const std::wstring& ownClientId, bool& changed);
+    bool cancelSyncedBooking(const std::wstring& clientId, int64_t remoteId, const std::wstring& actor);
+    bool createBooking(const EnterpriseBooking& booking, int64_t& newId, const std::wstring& actor, int64_t actingEmployee = 0);
+    bool createRecurringBookings(const EnterpriseBooking& firstBooking, int intervalDays, int occurrences, std::vector<int64_t>& newIds, const std::wstring& actor, int64_t actingEmployee = 0);
+    bool rescheduleBooking(const EnterpriseBooking& booking, const std::wstring& actor, int64_t actingEmployee = 0);
+    bool blockRoom(int64_t roomId, int64_t startUtc, int64_t endUtc, const std::wstring& reason, int64_t& newId, const std::wstring& actor, int64_t actingEmployee = 0);
+    bool cancelBooking(int64_t bookingId, const std::wstring& actor, int64_t actingEmployee = 0);
     bool activeBookingForRoom(int64_t roomId, int64_t nowUtc, EnterpriseBooking& booking);
     std::vector<EnterpriseBooking> bookingsForRoom(int64_t roomId, bool includeCancelled = true);
     std::vector<EnterpriseTask> tasks(bool includeArchived = false);
     std::vector<EnterpriseProject> projects(bool includeArchived = false);
     bool createProject(const EnterpriseProject& project, int64_t& newId, const std::wstring& actor);
     bool updateProject(const EnterpriseProject& project, const std::wstring& actor);
+    bool changeProjectStatus(int64_t projectId, const std::wstring& expected, const std::wstring& status, const std::wstring& actor);
     bool archiveProject(int64_t projectId, const std::wstring& actor);
     bool applySyncedProject(const std::wstring& externalId, const EnterpriseProject& project, const std::wstring& actor);
+    bool applySyncedProjectAssignment(const std::wstring& projectExternalId, const std::wstring& taskExternalId, bool present, const std::wstring& actor);
+    bool applySyncedProjectAssignmentSnapshot(const std::wstring& snapshotJson, bool& changed);
+    bool configureDesktopProjectAssignmentOutbox(const std::wstring& clientId);
+    bool nextDesktopProjectAssignmentOperation(std::wstring& operationId, int64_t& projectId, int64_t& taskId, bool& present, bool& expected, std::wstring& wireJson);
+    bool freezeDesktopProjectAssignmentOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson);
+    bool acknowledgeDesktopProjectAssignmentOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson, const std::wstring& actor);
     bool assignTaskToProject(int64_t taskId, int64_t projectId, const std::wstring& actor);
     bool setTaskProject(int64_t taskId, int64_t projectId, const std::wstring& actor);
     std::vector<EnterpriseTask> tasksForProject(int64_t projectId, bool includeArchived = false);
-    bool createTask(const EnterpriseTask& task, int64_t& newId, const std::wstring& actor);
-    bool updateTask(const EnterpriseTask& task, const std::wstring& actor);
-    bool updateTaskStatus(int64_t taskId, const std::wstring& status, const std::wstring& actor);
+    bool createTask(const EnterpriseTask& task, int64_t& newId, const std::wstring& actor, int64_t projectId = 0);
+    bool updateTask(const EnterpriseTask& task, const std::wstring& actor, int64_t expectedProject = -1, int64_t projectId = -1);
+    bool updateTaskStatus(int64_t taskId, const std::wstring& status, const std::wstring& actor, int64_t* repeatedTask = nullptr);
     bool archiveTask(int64_t taskId, const std::wstring& actor);
-    bool applySyncedTask(const std::wstring& externalId, const EnterpriseTask& task, const std::wstring& actor);
+    bool applySyncedTask(const std::wstring& externalId, const EnterpriseTask& task, const std::wstring& actor, bool schedulePresent = false);
+    bool applySyncedTaskRecurrence(const std::wstring& sourceExternalId, const std::wstring& successorExternalId, const std::wstring& actor);
+    bool applySyncedTaskRecurrenceSnapshot(const std::wstring& snapshotJson, bool& changed);
+    bool desktopTaskRecurrenceLinks(const std::wstring& clientId, const std::wstring& serverUrl, int64_t serverActor, std::vector<std::tuple<int64_t,std::wstring,std::wstring>>& links);
+    bool applySyncedMaintenanceRecurrence(const std::wstring& sourceExternalId, const std::wstring& successorExternalId, const std::wstring& actor);
+    bool applySyncedMaintenanceRecurrenceSnapshot(const std::wstring& snapshotJson, bool& changed);
+    bool desktopMaintenanceRecurrenceLinks(const std::wstring& clientId, const std::wstring& serverUrl, int64_t serverActor, std::vector<std::tuple<int64_t,std::wstring,std::wstring>>& links);
     std::vector<EnterpriseTaskDependency> taskDependencies(int64_t taskId);
     bool addTaskDependency(int64_t taskId, int64_t dependsOnTaskId, const std::wstring& actor);
     bool removeTaskDependency(int64_t taskId, int64_t dependsOnTaskId, const std::wstring& actor);
+    bool applySyncedTaskDependency(const std::wstring& taskExternalId, const std::wstring& dependencyExternalId, bool present, const std::wstring& actor);
+    bool configureDesktopDependencyOutbox(const std::wstring& clientId);
+    bool nextDesktopDependencyOperation(std::wstring& operationId, int64_t& taskId, int64_t& dependencyId, bool& present, bool& expected, std::wstring& wireJson);
+    bool freezeDesktopDependencyOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson);
+    bool acknowledgeDesktopDependencyOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson, const std::wstring& actor);
     std::vector<EnterpriseSubtask> subtasks(int64_t taskId, bool includeArchived = false);
     bool createSubtask(const EnterpriseSubtask& subtask, int64_t& newId, const std::wstring& actor);
-    bool updateSubtask(const EnterpriseSubtask& subtask, const std::wstring& actor);
+    bool updateSubtask(const EnterpriseSubtask& subtask, const std::wstring& actor, const EnterpriseSubtask* expected = nullptr);
     bool updateSubtaskStatus(int64_t subtaskId, const std::wstring& status, const std::wstring& actor);
-    bool archiveSubtask(int64_t subtaskId, const std::wstring& actor);
+    bool archiveSubtask(int64_t subtaskId, const std::wstring& actor, const EnterpriseSubtask* expected = nullptr);
+    bool configureDesktopSubtaskOutbox(const std::wstring& clientId);
+    bool nextDesktopSubtaskOperation(std::wstring& operationId, std::wstring& action, std::wstring& externalId, std::wstring& valueJson, std::wstring& expectedJson, std::wstring& wireJson);
+    bool freezeDesktopSubtaskOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson);
+    bool acknowledgeDesktopSubtaskOperation(const std::wstring& operationId, const std::wstring& serverUrl, int64_t serverActor, const std::wstring& wireJson, const std::wstring& actor);
+    bool applySyncedSubtask(const std::wstring& externalId, const std::wstring& taskExternalId, const std::wstring& assigneeExternalId, const EnterpriseSubtask& subtask, const std::wstring& actor);
     std::vector<EnterpriseAttachment> attachmentsFor(const std::wstring& subjectType, int64_t subjectId, bool includeArchived = false);
     bool createAttachment(const EnterpriseAttachment& attachment, int64_t& newId, const std::wstring& actor);
-    bool archiveAttachment(int64_t attachmentId, const std::wstring& actor);
+    bool archiveAttachment(int64_t attachmentId, const std::wstring& actor, int64_t actingEmployeeId = 0);
+    bool restoreAttachment(int64_t attachmentId, const std::wstring& actor);
     // Imports attachment metadata after its content-addressed binary object has
     // been accepted by Central. The device-local path is deliberately supplied
     // by the client and is never replicated between workspaces.
-    bool applySyncedAttachment(const std::wstring& externalId, const std::wstring& subjectExternalId, const std::wstring& uploaderExternalId, const EnterpriseAttachment& attachment, const std::wstring& actor);
+    bool applySyncedAttachment(const std::wstring& externalId, const std::wstring& subjectExternalId, const std::wstring& uploaderExternalId, const EnterpriseAttachment& attachment, const std::wstring& actor, bool* wasChanged = nullptr);
     bool createOrResetAccount(int64_t employeeId, const std::wstring& username, const std::wstring& password, bool mustChangePassword, const std::wstring& actor);
     bool authenticate(const std::wstring& username, const std::wstring& password, int64_t nowUtc, EnterpriseAccount& account);
     bool changePassword(int64_t employeeId, const std::wstring& oldPassword, const std::wstring& newPassword, const std::wstring& actor);
@@ -253,8 +282,9 @@ public:
     bool applySyncedMaintenanceOrder(const std::wstring& externalId, const std::wstring& assetExternalId, const EnterpriseMaintenanceOrder& order, const std::wstring& actor);
     std::vector<EnterpriseEmployee> employees(bool includeArchived = false);
     bool createEmployee(const EnterpriseEmployee& employee, int64_t& newId, const std::wstring& actor);
+    bool saveEmployeeWithRole(const EnterpriseEmployee& employee, const std::wstring& roleCode, const std::wstring& actor);
     bool updateEmployee(const EnterpriseEmployee& employee, const std::wstring& actor);
-    bool updatePresence(int64_t employeeId, const std::wstring& presence, const std::wstring& actor);
+    bool updatePresence(int64_t employeeId, const std::wstring& presence, const std::wstring& actor, int64_t actingEmployeeId = 0);
     bool archiveEmployee(int64_t employeeId, const std::wstring& actor);
     bool applySyncedEmployee(const std::wstring& externalId, const EnterpriseEmployee& employee, const std::wstring& actor);
     // Resolves a remote stable object identity to this client's SQLite key.
@@ -263,7 +293,7 @@ public:
     bool ensureSyncedExternalId(const std::wstring& objectType, int64_t localId, const std::wstring& externalId);
     std::vector<EnterpriseLeaveRequest> leaveRequests(int64_t employeeId = 0, bool includeClosed = false);
     bool createLeaveRequest(const EnterpriseLeaveRequest& request, int64_t& newId, const std::wstring& actor);
-    bool decideLeaveRequest(int64_t requestId, bool approved, int64_t decidedBy, const std::wstring& actor);
+    bool decideLeaveRequest(int64_t requestId, bool approved, int64_t decidedBy, const std::wstring& actor, const EnterpriseLeaveRequest* expected = nullptr);
     bool applySyncedLeaveRequest(const std::wstring& externalId, const EnterpriseLeaveRequest& request, const std::wstring& actor);
     std::vector<EnterpriseOrganizationUnit> organizationUnits(bool includeArchived = false);
     bool createOrganizationUnit(const EnterpriseOrganizationUnit& unit, int64_t& newId, const std::wstring& actor);
@@ -278,9 +308,11 @@ public:
     std::vector<std::wstring> permissionsForRole(int64_t roleId);
     std::vector<std::wstring> rolesForEmployee(int64_t employeeId);
     bool hasPermission(int64_t employeeId, const std::wstring& permission);
-    bool backupTo(const std::wstring& destinationPath, const std::wstring& actor);
-    bool restoreFrom(const std::wstring& sourcePath, const std::wstring& actor);
-    bool exportRoomsCsv(const std::wstring& destinationPath, const std::wstring& actor);
+    bool backupTo(const std::wstring& destinationPath, const std::wstring& actor, bool recordAudit = true);
+    bool recordBackup(const std::wstring& destinationPath, const std::wstring& actor);
+    bool restoreFrom(const std::wstring& sourcePath, const std::wstring& actor, bool recordAudit = true);
+    bool exportRoomsCsv(const std::wstring& destinationPath, const std::wstring& actor, bool recordAudit = true);
+    bool recordRoomExport(const std::wstring& destinationPath, const std::wstring& actor);
     bool importRoomsCsv(const std::wstring& sourcePath, int& importedCount, const std::wstring& actor);
     std::vector<std::wstring> auditLog(int limit = 100);
 

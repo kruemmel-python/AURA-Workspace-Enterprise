@@ -4,6 +4,10 @@ AURA Workspace Enterprise ist ein natives Office-Management-System für Unterneh
 
 > Der Produktbuild verwendet die KR-Compiler-Toolchain und legt Build-Ausgaben, Caches und temporäre Dateien ausschließlich innerhalb des Arbeitsbereichs ab.
 
+## Linux-Oberfläche
+
+Eine erste GTK-3-Oberfläche im Windows-Stil ist unter `clients/linux/` verfügbar. Build, Start, Serververbindung und den gegenüber Windows noch eingeschränkten Funktionsumfang beschreibt [clients/linux/README.md](clients/linux/README.md).
+
 ## Funktionsbereiche
 
 - **Räume & Ressourcen:** Stammdaten, Suche, Ausstattung, Kapazität, Archivierung, Sperrzeiten, Einzel- und Serientermine, Umbuchung, Stornierung, Konflikt- und Rechteprüfung sowie Audit-Historie.

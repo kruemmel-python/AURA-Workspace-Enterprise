@@ -247,7 +247,12 @@ struct AppState {
 } g_State;
 
 std::unique_ptr<EnterpriseDatabase> g_Database;
-bool ApplyIncomingRoomChanges(const std::string& batch);
+bool ApplyIncomingRoomChanges(const std::string& batch, bool skipBookingEvents, bool skipProjectAssignments, bool* attachmentChanged = nullptr);
+bool DrainDesktopSubtasks();
+bool DrainDesktopDependencies();
+bool DrainDesktopProjectAssignments();
+bool DrainDesktopTaskRecurrences();
+bool DrainDesktopMaintenanceRecurrences();
 std::filesystem::path FindWorkspaceRoot();
 int64_t g_CurrentEmployeeId = 0;
 bool g_Authenticated = false;
@@ -286,25 +291,72 @@ public:
         module_ = LoadLibraryW((std::filesystem::path(executable).parent_path() / L"aura_services.dll").wstring().c_str());
         if (!module_) return;
         publish_ = reinterpret_cast<PublishFn>(GetProcAddress(module_, "aura_publish_event"));
+        cancelDesktopBooking_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_cancel_desktop_booking"));
+        leaveProtocol_ = reinterpret_cast<LeaveProtocolFn>(GetProcAddress(module_, "aura_desktop_leave_protocol"));
+        attachmentProtocol_ = reinterpret_cast<LeaveProtocolFn>(GetProcAddress(module_, "aura_desktop_attachment_protocol"));
+        publishAttachment_ = reinterpret_cast<PublishAttachmentFn>(GetProcAddress(module_, "aura_publish_desktop_attachment"));
+        inspectAttachmentArchive_ = reinterpret_cast<StatusFn>(GetProcAddress(module_, "aura_inspect_desktop_attachment_archive"));
+        prepareAttachmentArchive_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_prepare_desktop_attachment_archive_abandon"));
+        abandonAttachmentArchive_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_abandon_desktop_attachment_archive"));
         preflight_ = reinterpret_cast<PreflightFn>(GetProcAddress(module_, "aura_preflight_booking"));
         reserve_ = reinterpret_cast<ReserveFn>(GetProcAddress(module_, "aura_reserve_booking"));
+        reserveKeyed_ = reinterpret_cast<ReserveKeyedFn>(GetProcAddress(module_, "aura_reserve_booking_with_room_key"));
+        reserveDetails_ = reinterpret_cast<ReserveDetailsFn>(GetProcAddress(module_, "aura_reserve_booking_with_details"));
         commit_ = reinterpret_cast<CommitFn>(GetProcAddress(module_, "aura_commit_booking"));
         release_ = reinterpret_cast<ReleaseFn>(GetProcAddress(module_, "aura_release_booking"));
         flush_ = reinterpret_cast<FlushFn>(GetProcAddress(module_, "aura_flush_outbox"));
         fetchChanges_ = reinterpret_cast<FetchChangesFn>(GetProcAddress(module_, "aura_fetch_changes"));
+        bookingSnapshot_ = reinterpret_cast<BookingSnapshotFn>(GetProcAddress(module_, "aura_desktop_booking_snapshot"));
+        attachmentSnapshot_ = reinterpret_cast<BookingSnapshotFn>(GetProcAddress(module_, "aura_desktop_attachment_snapshot"));
+        assignmentSnapshot_ = reinterpret_cast<BookingSnapshotFn>(GetProcAddress(module_, "aura_desktop_project_assignment_snapshot"));
+        recurrenceSnapshot_ = reinterpret_cast<BookingSnapshotFn>(GetProcAddress(module_, "aura_desktop_task_recurrence_snapshot"));
+        maintenanceRecurrenceSnapshot_ = reinterpret_cast<BookingSnapshotFn>(GetProcAddress(module_, "aura_desktop_maintenance_recurrence_snapshot"));
         status_ = reinterpret_cast<StatusFn>(GetProcAddress(module_, "aura_service_status"));
         uploadAttachment_ = reinterpret_cast<UploadAttachmentFn>(GetProcAddress(module_, "aura_upload_attachment"));
         downloadAttachment_ = reinterpret_cast<DownloadAttachmentFn>(GetProcAddress(module_, "aura_download_attachment"));
-        if (!publish_ || !preflight_ || !reserve_ || !commit_ || !release_ || !flush_ || !fetchChanges_ || !status_) { FreeLibrary(module_); module_ = nullptr; publish_ = nullptr; preflight_ = nullptr; reserve_ = nullptr; commit_ = nullptr; release_ = nullptr; flush_ = nullptr; fetchChanges_ = nullptr; status_ = nullptr; uploadAttachment_ = nullptr; downloadAttachment_ = nullptr; return; }
-        flush_();
-        collectChanges(root);
+        subtaskSend_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_sync_desktop_subtask"));
+        dependencySend_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_sync_desktop_dependency"));
+        projectAssignmentSend_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_sync_desktop_project_assignment"));
+        recurrenceSend_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_sync_desktop_task_recurrence"));
+        maintenanceRecurrenceSend_ = reinterpret_cast<SubtaskSendFn>(GetProcAddress(module_, "aura_sync_desktop_maintenance_recurrence"));
+        subtaskContext_ = reinterpret_cast<SubtaskContextFn>(GetProcAddress(module_, "aura_desktop_subtask_context"));
+        if (!publish_ || !preflight_ || !reserve_ || !commit_ || !release_ || !flush_ || !fetchChanges_ || !status_) { FreeLibrary(module_); module_ = nullptr; publish_ = nullptr; preflight_ = nullptr; reserve_ = nullptr; reserveKeyed_ = nullptr; commit_ = nullptr; release_ = nullptr; flush_ = nullptr; fetchChanges_ = nullptr; status_ = nullptr; uploadAttachment_ = nullptr; downloadAttachment_ = nullptr; return; }
+        if (flush_()==0) {
+            collectChanges(root);
+            syncSubtasks();syncDependencies();syncProjectAssignments();syncTaskRecurrences();syncMaintenanceRecurrences();
+        }
     }
     bool synchronize() const {
         if (!flush_ || root_.empty()) return false;
-        flush_();
-        return collectChanges(root_);
+        if (flush_()!=0) {
+            std::ofstream diagnostic(root_ / L"KR_BUILD" / L"sync-last-error.log", std::ios::binary | std::ios::trunc);
+            if(diagnostic){char detail[256]{};if(status_&&status_(detail,static_cast<int32_t>(sizeof(detail)))==0)diagnostic<<detail;else diagnostic<<"Synchronisation angehalten: ausstehende lokale Ereignisse konnten nicht übertragen werden.";}
+            return false;
+        }
+        const bool changed=collectChanges(root_);
+        syncSubtasks();syncDependencies();syncProjectAssignments();syncTaskRecurrences();syncMaintenanceRecurrences();
+        return changed;
     }
+    bool subtaskContext(const std::string& employee,int64_t& actor,int64_t& account) const { return subtaskContext_ && subtaskContext_(employee.c_str(),&actor,&account)==0; }
+    bool sendSubtask(const std::string& payload) const { return subtaskSend_ && subtaskSend_(payload.c_str())==0; }
+    bool sendDependency(const std::string& payload) const { return dependencySend_ && dependencySend_(payload.c_str())==0; }
+    bool sendProjectAssignment(const std::string& payload) const { return projectAssignmentSend_ && projectAssignmentSend_(payload.c_str())==0; }
+    bool sendTaskRecurrence(const std::string& payload) const { return recurrenceSend_ && recurrenceSend_(payload.c_str())==0; }
+    bool sendMaintenanceRecurrence(const std::string& payload) const { return maintenanceRecurrenceSend_ && maintenanceRecurrenceSend_(payload.c_str())==0; }
+    bool supportsLeaveProtocol() const { return leaveProtocol_ && leaveProtocol_()==1; }
+    bool supportsAttachmentProtocol() const { return attachmentProtocol_ && attachmentProtocol_()==1; }
+    bool inspectAttachmentArchive(std::string& review) const {if(!inspectAttachmentArchive_||!prepareAttachmentArchive_||!abandonAttachmentArchive_)return false;std::vector<char> buffer(1024*1024,'\0');if(inspectAttachmentArchive_(buffer.data(),static_cast<int32_t>(buffer.size()))!=0)return false;review=buffer.data();return true;}
+    bool prepareAttachmentArchive(const std::string& review) const {return prepareAttachmentArchive_&&prepareAttachmentArchive_(review.c_str())==0;}
+    bool abandonAttachmentArchive(const std::string& review) const {return abandonAttachmentArchive_&&abandonAttachmentArchive_(review.c_str())==0;}
     bool publish(const std::string& topic, const std::string& payload) const { return publish_ && publish_(topic.c_str(), payload.c_str()) == 0; }
+    bool publishAttachment(const std::wstring& path,const std::string& payload) const {
+        if(!publishAttachment_)return false;
+        const int bytes=WideCharToMultiByte(CP_UTF8,0,path.c_str(),-1,nullptr,0,nullptr,nullptr);
+        if(bytes<=1)return false;
+        std::string encoded(static_cast<size_t>(bytes),'\0');WideCharToMultiByte(CP_UTF8,0,path.c_str(),-1,encoded.data(),bytes,nullptr,nullptr);
+        return publishAttachment_(encoded.c_str(),payload.c_str())==0;
+    }
+    bool cancelDesktopBooking(const std::string& payload) const { return cancelDesktopBooking_ && cancelDesktopBooking_(payload.c_str()) == 0; }
     // A missing upload symbol only occurs with an older bundled service DLL;
     // keep the local evidence object intact and report the missing central copy.
     int32_t uploadAttachment(const std::wstring& path) const {
@@ -323,23 +375,43 @@ public:
     const std::wstring& clientId() const { return clientId_; }
     int32_t preflightBooking(int64_t bookingId, int64_t roomId, int64_t start, int64_t end) const { return preflight_ ? preflight_(bookingId, roomId, start, end) : 0; }
     int32_t reserveBooking(int64_t reservationId, int64_t bookingId, int64_t roomId, int64_t start, int64_t end) const { return reserve_ ? reserve_(reservationId, bookingId, roomId, start, end) : 0; }
+    int32_t reserveBookingWithRoomKey(int64_t reservationId, int64_t bookingId, int64_t roomId, int64_t start, int64_t end, const std::string& roomKey) const {
+        if (GetEnvironmentVariableW(L"AURA_SYNC_URL", nullptr, 0) == 0) return 0;
+        if (!reserveKeyed_ || roomKey.empty()) return 8;
+        return reserveKeyed_(reservationId, bookingId, roomId, start, end, roomKey.c_str());
+    }
+    int32_t reserveBookingWithDetails(int64_t reservationId,int64_t bookingId,int64_t roomId,int64_t start,int64_t end,const std::string& roomKey,const std::string& employeeKey,int attendees) const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0)return 0;
+        if(!reserveDetails_||roomKey.empty()||employeeKey.empty()||attendees<=0)return 8;
+        return reserveDetails_(reservationId,bookingId,roomId,start,end,roomKey.c_str(),employeeKey.c_str(),attendees);
+    }
     int32_t commitBooking(int64_t reservationId, int64_t bookingId, bool reschedule) const { return commit_ ? commit_(reservationId, bookingId, reschedule ? 1 : 0) : 0; }
     int32_t releaseBooking(int64_t reservationId) const { return release_ ? release_(reservationId) : 0; }
     std::wstring status() const {
+        std::error_code error;
+        if(!root_.empty()&&std::filesystem::exists(root_/L"KR_BUILD"/L"sync-last-error.log",error))return L"Abgleich angehalten – Details in KR_BUILD\\sync-last-error.log";
+        error.clear();
+        if(!root_.empty()&&std::filesystem::exists(root_/L"KR_BUILD"/L"attachment-snapshot-error.log",error))return L"Anhangsabgleich eingeschränkt – Details in KR_BUILD\\attachment-snapshot-error.log";
         if (!status_) return L"Synchronisationsdienst nicht geladen";
         char text[256]{}; return status_(text, static_cast<int32_t>(sizeof(text))) == 0 ? Utf8ToWide(text) : L"Synchronisationsdienst nicht verfügbar";
     }
 private:
     using PublishFn = int32_t(*)(const char*, const char*);
+    using PublishAttachmentFn = int32_t(*)(const char*, const char*);
     using PreflightFn = int32_t(*)(int64_t, int64_t, int64_t, int64_t);
     using ReserveFn = int32_t(*)(int64_t, int64_t, int64_t, int64_t, int64_t);
+    using ReserveKeyedFn = int32_t(*)(int64_t, int64_t, int64_t, int64_t, int64_t, const char*);
+    using ReserveDetailsFn = int32_t(*)(int64_t, int64_t, int64_t, int64_t, int64_t, const char*, const char*, int32_t);
     using CommitFn = int32_t(*)(int64_t, int64_t, int32_t);
     using ReleaseFn = int32_t(*)(int64_t);
     using FlushFn = int32_t(*)();
     using FetchChangesFn = int32_t(*)(int64_t, char*, int32_t, int64_t*);
+    using BookingSnapshotFn = int32_t(*)(char*, int32_t, int64_t*);
     using StatusFn = int32_t(*)(char*, int32_t);
     using UploadAttachmentFn = int32_t(*)(const char*);
     using DownloadAttachmentFn = int32_t(*)(const char*, const char*);
+    using SubtaskSendFn = int32_t(*)(const char*);
+    using SubtaskContextFn = int32_t(*)(const char*, int64_t*, int64_t*);
     static std::wstring Utf8ToWide(const char* source) {
         if (!source || !*source) return L"";
         const int chars = MultiByteToWideChar(CP_UTF8, 0, source, -1, nullptr, 0);
@@ -349,30 +421,176 @@ private:
         return result;
     }
     HMODULE module_ = nullptr;
+    using LeaveProtocolFn = int32_t (*)();
+    LeaveProtocolFn leaveProtocol_ = nullptr;
+    LeaveProtocolFn attachmentProtocol_ = nullptr;
     PublishFn publish_ = nullptr;
+    PublishAttachmentFn publishAttachment_ = nullptr;
     PreflightFn preflight_ = nullptr;
     ReserveFn reserve_ = nullptr;
+    ReserveKeyedFn reserveKeyed_ = nullptr;
+    ReserveDetailsFn reserveDetails_ = nullptr;
     CommitFn commit_ = nullptr;
     ReleaseFn release_ = nullptr;
     FlushFn flush_ = nullptr;
     StatusFn status_ = nullptr;
+    StatusFn inspectAttachmentArchive_ = nullptr;
+    SubtaskSendFn prepareAttachmentArchive_ = nullptr;
+    SubtaskSendFn abandonAttachmentArchive_ = nullptr;
     UploadAttachmentFn uploadAttachment_ = nullptr;
     DownloadAttachmentFn downloadAttachment_ = nullptr;
     FetchChangesFn fetchChanges_ = nullptr;
+    BookingSnapshotFn bookingSnapshot_ = nullptr;
+    BookingSnapshotFn attachmentSnapshot_ = nullptr;
+    BookingSnapshotFn assignmentSnapshot_ = nullptr;
+    BookingSnapshotFn recurrenceSnapshot_ = nullptr;
+    BookingSnapshotFn maintenanceRecurrenceSnapshot_ = nullptr;
+    SubtaskSendFn subtaskSend_ = nullptr;
+    SubtaskSendFn dependencySend_ = nullptr;
+    SubtaskSendFn projectAssignmentSend_ = nullptr;
+    SubtaskSendFn recurrenceSend_ = nullptr;
+    SubtaskSendFn maintenanceRecurrenceSend_ = nullptr;
+    SubtaskSendFn cancelDesktopBooking_ = nullptr;
+    SubtaskContextFn subtaskContext_ = nullptr;
     std::wstring clientId_;
     std::filesystem::path root_;
+    void syncTaskRecurrences() const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0 || !g_Database)return;
+        const auto path=root_/L"KR_BUILD"/L"task-recurrence-sync-error.log";
+        if(!recurrenceSend_ || !subtaskContext_ || !DrainDesktopTaskRecurrences()) {std::ofstream diagnostic(path,std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Folgeaufgabenabgleich angehalten: Server, Verbindung, Zuordnung oder Berechtigung prüfen.";}
+        else {std::error_code ignored;std::filesystem::remove(path,ignored);}
+    }
+    void syncMaintenanceRecurrences() const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0 || !g_Database)return;
+        const auto path=root_/L"KR_BUILD"/L"maintenance-recurrence-sync-error.log";
+        if(!maintenanceRecurrenceSend_ || !subtaskContext_ || !DrainDesktopMaintenanceRecurrences()) {std::ofstream diagnostic(path,std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Folgewartungsabgleich angehalten: Server, Verbindung, Zuordnung oder Berechtigung prüfen.";}
+        else {std::error_code ignored;std::filesystem::remove(path,ignored);}
+    }
+    void syncSubtasks() const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0 || !g_Database)return;
+        const auto path=root_ / L"KR_BUILD" / L"subtask-sync-error.log";
+        const char* error=nullptr;
+        if(!subtaskSend_ || !subtaskContext_)error="Die Dienstbibliothek unterstützt den Unteraufgabenabgleich nicht.";
+        else if(!g_Database->configureDesktopSubtaskOutbox(clientId_))error="Unteraufgabenwarteschlange konnte nicht eingerichtet werden.";
+        else if(!DrainDesktopSubtasks())error="Unteraufgabenabgleich angehalten: Serververbindung, Zuordnung, Warteschlange oder Konflikt prüfen.";
+        if(error){std::ofstream diagnostic(path,std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<error;}
+        else {std::error_code ignored;std::filesystem::remove(path,ignored);}
+    }
+    void syncDependencies() const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0 || !g_Database)return;
+        const auto path=root_/L"KR_BUILD"/L"dependency-sync-error.log";const char* error=nullptr;
+        if(!dependencySend_||!subtaskContext_)error="Die Dienstbibliothek unterstützt den Voraussetzungenabgleich nicht.";
+        else if(!g_Database->configureDesktopDependencyOutbox(clientId_))error="Voraussetzungenwarteschlange konnte nicht eingerichtet werden.";
+        else if(!DrainDesktopDependencies())error="Voraussetzungenabgleich angehalten: Serververbindung, Zuordnung, Warteschlange oder Konflikt prüfen.";
+        if(error){std::ofstream diagnostic(path,std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<error;}
+        else {std::error_code ignored;std::filesystem::remove(path,ignored);}
+    }
+    void syncProjectAssignments() const {
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0 || !g_Database)return;
+        const auto path=root_/L"KR_BUILD"/L"project-assignment-sync-error.log";const char* error=nullptr;
+        if(!projectAssignmentSend_||!subtaskContext_)error="Die Dienstbibliothek unterstützt den Projektzuordnungsabgleich nicht.";
+        else if(!g_Database->configureDesktopProjectAssignmentOutbox(clientId_))error="Projektzuordnungswarteschlange konnte nicht eingerichtet werden.";
+        else if(!DrainDesktopProjectAssignments())error="Projektzuordnungsabgleich angehalten: Serververbindung, Zuordnung, Warteschlange oder Konflikt prüfen.";
+        if(error){std::ofstream diagnostic(path,std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<error;}
+        else {std::error_code ignored;std::filesystem::remove(path,ignored);}
+    }
     bool collectChanges(const std::filesystem::path& root) const {
         if (!fetchChanges_ || GetEnvironmentVariableW(L"AURA_SYNC_URL", nullptr, 0) == 0) return false;
+        const auto fail=[&](const char* message){std::ofstream diagnostic(root / L"KR_BUILD" / L"sync-last-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<message;return false;};
+        // Capture local divergence before applying any newer server events. A
+        // failed setup must leave the cursor untouched so it can be retried.
+        if (g_Database && ((subtaskSend_ && subtaskContext_ && !g_Database->configureDesktopSubtaskOutbox(clientId_)) ||
+                           (dependencySend_ && subtaskContext_ && !g_Database->configureDesktopDependencyOutbox(clientId_)) ||
+                           (projectAssignmentSend_ && subtaskContext_ && !g_Database->configureDesktopProjectAssignmentOutbox(clientId_)))) {
+            std::ofstream diagnostic(root / L"KR_BUILD" / L"sync-last-error.log", std::ios::binary | std::ios::trunc);
+            if (diagnostic) diagnostic << "Lokale Synchronisationswarteschlange konnte nicht eingerichtet werden.";
+            return false;
+        }
         const std::filesystem::path cursorFile = root / L"KR_BUILD" / L"sync-cursor.txt";
         const std::filesystem::path inboxFile = root / L"KR_BUILD" / L"sync-inbox.ndjson";
         int64_t cursor = 0; { std::ifstream input(cursorFile); if (input) input >> cursor; if (cursor < 0) cursor = 0; }
-        std::vector<char> buffer(1024 * 1024, '\0'); int64_t next = cursor;
-        if (fetchChanges_(cursor, buffer.data(), static_cast<int32_t>(buffer.size()), &next) != 0 || next < cursor) return false;
-        if (!ApplyIncomingRoomChanges(buffer.data())) { std::ofstream diagnostic(root / L"KR_BUILD" / L"sync-last-error.log", std::ios::binary | std::ios::trunc); if(diagnostic){if(!g_SyncApplyError.empty())diagnostic<<g_SyncApplyError;else if(g_Database){const std::wstring error=g_Database->error();diagnostic<<std::string(error.begin(),error.end());}} return false; }
+        // The service accepts feed responses up to 8 MiB.  The serialized
+        // events need the same capacity here, plus the terminating NUL;
+        // otherwise a valid response above 1 MiB can never advance the cursor.
+        std::vector<char> buffer(8 * 1024 * 1024 + 1, '\0'); int64_t next = cursor;
+        if (fetchChanges_(cursor, buffer.data(), static_cast<int32_t>(buffer.size()), &next) != 0 || next < cursor) return fail("Serverereignisse konnten nicht abgerufen werden. Verbindung, Zugangsdaten und Serverstand prüfen.");
+        // A snapshot at this exact feed cursor represents the final booking
+        // state for the whole batch. Applying intermediate booking events first
+        // can create false conflicts when a released slot is reused.
+        std::vector<char> bookings;int64_t snapshotCursor=-1;bool useSnapshot=false,snapshotChanged=false;
+        if(bookingSnapshot_ && g_Database){
+            bookings.resize(8*1024*1024+1,'\0');
+            const int32_t snapshotResult=bookingSnapshot_(bookings.data(),static_cast<int32_t>(bookings.size()),&snapshotCursor);
+            if(snapshotResult==0 && snapshotCursor!=next)return fail("Serverstand während des Buchungsabgleichs geändert; erneuter Versuch folgt.");
+            useSnapshot=snapshotResult==0;
+        }
+        std::vector<char> assignments;int64_t assignmentCursor=-1;bool useAssignmentSnapshot=false,assignmentChanged=false;
+        if(assignmentSnapshot_ && g_Database){
+            assignments.resize(8*1024*1024+1,'\0');
+            const int32_t result=assignmentSnapshot_(assignments.data(),static_cast<int32_t>(assignments.size()),&assignmentCursor);
+            if(result==0 && assignmentCursor!=next)return fail("Serverstand während des Projektabgleichs geändert; erneuter Versuch folgt.");
+            useAssignmentSnapshot=result==0;
+        }
+        std::vector<char> recurrences;int64_t recurrenceCursor=-1;bool useRecurrenceSnapshot=false,recurrenceChanged=false;
+        if(recurrenceSnapshot_ && g_Database){
+            recurrences.resize(8*1024*1024+1,'\0');const int32_t result=recurrenceSnapshot_(recurrences.data(),static_cast<int32_t>(recurrences.size()),&recurrenceCursor);
+            if(result==0 && recurrenceCursor!=next)return fail("Serverstand während des Folgeaufgabenabgleichs geändert; erneuter Versuch folgt.");
+            if(result!=0){std::ofstream diagnostic(root/L"KR_BUILD"/L"task-recurrence-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Folgeaufgabenbestand nicht verfügbar; Server und Berechtigungen prüfen. Code "<<result;}
+            useRecurrenceSnapshot=result==0;
+        }
+        std::vector<char> maintenanceRecurrences;int64_t maintenanceRecurrenceCursor=-1;bool useMaintenanceRecurrenceSnapshot=false,maintenanceRecurrenceChanged=false;
+        if(maintenanceRecurrenceSnapshot_ && g_Database){
+            maintenanceRecurrences.resize(8*1024*1024+1,'\0');const int32_t result=maintenanceRecurrenceSnapshot_(maintenanceRecurrences.data(),static_cast<int32_t>(maintenanceRecurrences.size()),&maintenanceRecurrenceCursor);
+            if(result==0 && maintenanceRecurrenceCursor!=next)return fail("Serverstand während des Wartungsfolgeabgleichs geändert; erneuter Versuch folgt.");
+            if(result!=0){std::ofstream diagnostic(root/L"KR_BUILD"/L"maintenance-recurrence-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Wartungsfolge-Bestand nicht verfügbar; Server und Berechtigungen prüfen. Code "<<result;}
+            useMaintenanceRecurrenceSnapshot=result==0;
+        }
+        std::vector<char> attachments;int64_t attachmentCursor=-1;bool useAttachmentSnapshot=false,attachmentChanged=false;
+        if(attachmentSnapshot_ && supportsAttachmentProtocol() && g_Database){
+            attachments.resize(8*1024*1024+1,'\0');
+            const int32_t result=attachmentSnapshot_(attachments.data(),static_cast<int32_t>(attachments.size()),&attachmentCursor);
+            if(result==0 && attachmentCursor!=next)return fail("Serverstand während des Anhangsabgleichs geändert; erneuter Versuch folgt.");
+            if(result!=0 && result!=11 && result!=12){std::ofstream diagnostic(root / L"KR_BUILD" / L"attachment-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Anhangsbestand nicht verfügbar; Synchronisation pausiert. Code "<<result;return false;}
+            if(result==11 || result==12){std::ofstream diagnostic(root / L"KR_BUILD" / L"attachment-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Anhangsbestand nicht verfügbar: Server aktualisieren oder Berechtigungen prüfen.";}
+            else {std::error_code ignored;std::filesystem::remove(root / L"KR_BUILD" / L"attachment-snapshot-error.log",ignored);}
+            useAttachmentSnapshot=result==0;
+        }
+        if (!ApplyIncomingRoomChanges(buffer.data(),useSnapshot,useAssignmentSnapshot)) { std::ofstream diagnostic(root / L"KR_BUILD" / L"sync-last-error.log", std::ios::binary | std::ios::trunc); if(diagnostic){if(!g_SyncApplyError.empty())diagnostic<<g_SyncApplyError;else if(g_Database){const std::wstring error=g_Database->error();diagnostic<<std::string(error.begin(),error.end());}} return false; }
+        if(useAttachmentSnapshot && !ApplyIncomingRoomChanges(attachments.data(),false,false,&attachmentChanged)) {
+            std::ofstream diagnostic(root / L"KR_BUILD" / L"sync-last-error.log",std::ios::binary|std::ios::trunc);
+            if(diagnostic)diagnostic<<"Anhangsbestand konnte nicht übernommen werden: "<<g_SyncApplyError;
+            return false;
+        }
+        if(useSnapshot){
+            if(!g_Database->applySyncedBookingSnapshot(Utf8ToWide(bookings.data()),clientId_,snapshotChanged)){
+                std::ofstream diagnostic(root / L"KR_BUILD" / L"booking-sync-error.log",std::ios::binary|std::ios::trunc);
+                if(diagnostic)diagnostic<<"Der zentrale Buchungsbestand konnte nicht übernommen werden.";
+                return false;
+            }
+            std::error_code ignored;std::filesystem::remove(root / L"KR_BUILD" / L"booking-sync-error.log",ignored);
+        }
+        if(useAssignmentSnapshot){
+            if(!g_Database->applySyncedProjectAssignmentSnapshot(Utf8ToWide(assignments.data()),assignmentChanged)){
+                std::ofstream diagnostic(root / L"KR_BUILD" / L"project-assignment-snapshot-error.log",std::ios::binary|std::ios::trunc);
+                if(diagnostic)diagnostic<<"Der zentrale Projektzuordnungsbestand konnte nicht übernommen werden.";
+                return false;
+            }
+            std::error_code ignored;std::filesystem::remove(root / L"KR_BUILD" / L"project-assignment-snapshot-error.log",ignored);
+        }
+        if(useRecurrenceSnapshot){
+            if(!g_Database->applySyncedTaskRecurrenceSnapshot(Utf8ToWide(recurrences.data()),recurrenceChanged)){std::ofstream diagnostic(root/L"KR_BUILD"/L"task-recurrence-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Folgeaufgabenbestand enthält fehlende oder widersprüchliche Zuordnungen.";return false;}
+            std::error_code ignored;std::filesystem::remove(root/L"KR_BUILD"/L"task-recurrence-snapshot-error.log",ignored);
+        }
+        if(useMaintenanceRecurrenceSnapshot){
+            if(!g_Database->applySyncedMaintenanceRecurrenceSnapshot(Utf8ToWide(maintenanceRecurrences.data()),maintenanceRecurrenceChanged)){std::ofstream diagnostic(root/L"KR_BUILD"/L"maintenance-recurrence-snapshot-error.log",std::ios::binary|std::ios::trunc);if(diagnostic)diagnostic<<"Folgewartungsbestand enthält fehlende oder widersprüchliche Zuordnungen.";return false;}
+            std::error_code ignored;std::filesystem::remove(root/L"KR_BUILD"/L"maintenance-recurrence-snapshot-error.log",ignored);
+        }
         std::ofstream inbox(inboxFile, std::ios::binary | std::ios::app); if (!inbox) return false;
-        inbox << buffer.data() << "\n"; inbox.close();
-        std::ofstream output(cursorFile, std::ios::binary | std::ios::trunc); if (output) output << next << "\n";
-        return next > cursor;
+        inbox << buffer.data() << "\n"; inbox.close();if(!inbox)return false;
+        std::ofstream output(cursorFile, std::ios::binary | std::ios::trunc);
+        if(!output)return false;output << next << "\n";output.close();if(!output)return false;
+        { std::error_code ignored;std::filesystem::remove(root / L"KR_BUILD" / L"sync-last-error.log",ignored); }
+        return next > cursor || snapshotChanged || assignmentChanged || recurrenceChanged || maintenanceRecurrenceChanged || attachmentChanged;
     }
 };
 
@@ -433,6 +651,7 @@ void PublishTaskChange(const EnterpriseTask& task, const char* topic) {
         ",\"title\":" + JsonString(task.title) + ",\"department\":" + JsonString(task.department) +
         ",\"priority\":" + JsonString(task.priority) + ",\"status\":" + JsonString(task.status) +
         ",\"assigneeId\":" + std::to_string(task.assigneeId) + ",\"createdBy\":" + std::to_string(g_CurrentEmployeeId) +
+        ",\"dueAt\":" + std::to_string(task.dueAt) + ",\"recurrenceDays\":" + std::to_string(task.recurrenceDays) +
         ",\"active\":" + (task.active ? "true" : "false") + "}";
     g_SyncService.publish(topic, payload);
 }
@@ -479,11 +698,12 @@ void PublishOrganizationChange(const EnterpriseOrganizationUnit& unit, const cha
     g_SyncService.publish(topic, payload);
 }
 
-void PublishLeaveChange(const EnterpriseLeaveRequest& leave, const char* topic) {
-    const std::wstring clientId=g_SyncService.clientId(); if(clientId.empty()||!topic||leave.id<=0)return;
-    const std::string sourceId=StableSyncObjectId(L"leave",leave.id);if(sourceId.empty())return;
-    const std::string payload="{\"id\":"+JsonString(std::wstring(sourceId.begin(),sourceId.end()))+",\"employeeId\":"+std::to_string(leave.employeeId)+",\"startsAt\":"+std::to_string(leave.startsAt)+",\"endsAt\":"+std::to_string(leave.endsAt)+",\"reason\":"+JsonString(leave.reason)+",\"status\":"+JsonString(leave.status)+",\"decidedBy\":"+std::to_string(leave.decidedBy)+"}";
-    g_SyncService.publish(topic,payload);
+bool PublishLeaveChange(const EnterpriseLeaveRequest& leave, const char* topic) {
+    if(!topic || leave.id<=0 || !g_SyncService.supportsLeaveProtocol()) return false;
+    const std::string id=StableSyncObjectId(L"leave",leave.id),employee=StableSyncObjectId(L"employee",leave.employeeId),decider=StableSyncObjectId(L"employee",leave.decidedBy);
+    if(id.empty()||employee.empty()||(leave.status!=L"pending"&&decider.empty()))return false;
+    const std::string payload="{\"id\":"+JsonString(Utf8ToWide(id))+",\"employeeExternalId\":"+JsonString(Utf8ToWide(employee))+",\"deciderExternalId\":"+JsonString(Utf8ToWide(decider))+",\"startsAt\":"+std::to_string(leave.startsAt)+",\"endsAt\":"+std::to_string(leave.endsAt)+",\"reason\":"+JsonString(leave.reason)+",\"status\":"+JsonString(leave.status)+"}";
+    const std::string event=std::string("desktop.")+topic;return g_SyncService.publish(event,payload);
 }
 
 void PublishFacilityAssetChange(const EnterpriseFacilityAsset& asset, const char* topic) {
@@ -510,12 +730,23 @@ void PublishTaskApprovalChange(const EnterpriseTaskApproval& approval,const char
 void PublishCommentChange(const EnterpriseComment& comment,const char* topic){
     if(!topic||comment.id<=0||(comment.subjectType!=L"task"&&comment.subjectType!=L"ticket"))return;
     const std::string id=StableSyncObjectId(L"comment",comment.id),subjectId=StableSyncObjectId(comment.subjectType,comment.subjectId),authorId=StableSyncObjectId(L"employee",comment.authorId);if(id.empty()||subjectId.empty()||authorId.empty())return;
-    const std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(comment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"authorId\":"+JsonString(std::wstring(authorId.begin(),authorId.end()))+",\"body\":"+JsonString(comment.body)+"}";g_SyncService.publish(topic,payload);
+    // The caller has just created the record; retrieve SQLite's UTC creation
+    // time so an offline transmission retains the original chronology.
+    std::wstring createdAt=comment.createdAt;
+    if(createdAt.empty()&&g_Database){for(const auto& saved:g_Database->commentsFor(comment.subjectType,comment.subjectId))if(saved.id==comment.id){createdAt=saved.createdAt;break;}}
+    if(createdAt.size()==19&&createdAt[10]==L' '){createdAt[10]=L'T';createdAt+=L'Z';}
+    std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(comment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"authorId\":"+JsonString(std::wstring(authorId.begin(),authorId.end()))+",\"body\":"+JsonString(comment.body);
+    if(!createdAt.empty())payload+=",\"createdAt\":"+JsonString(createdAt);
+    payload+="}";g_SyncService.publish(topic,payload);
 }
-void PublishAttachmentChange(const EnterpriseAttachment& attachment,const char* topic){
-    if(!topic||attachment.id<=0||(attachment.subjectType!=L"task"&&attachment.subjectType!=L"ticket"))return;
-    const std::string id=StableSyncObjectId(L"attachment",attachment.id),subjectId=StableSyncObjectId(attachment.subjectType,attachment.subjectId),uploaderId=StableSyncObjectId(L"employee",attachment.uploadedBy);if(id.empty()||subjectId.empty()||uploaderId.empty())return;
-    const std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(attachment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"originalName\":"+JsonString(attachment.originalName)+",\"sizeBytes\":"+std::to_string(attachment.sizeBytes)+",\"sha256\":"+JsonString(attachment.sha256)+",\"uploadedBy\":"+JsonString(std::wstring(uploaderId.begin(),uploaderId.end()))+",\"active\":"+(attachment.active?"true":"false")+"}";g_SyncService.publish(topic,payload);
+bool PublishAttachmentChange(const EnterpriseAttachment& attachment,const char* topic){
+    if(!topic||attachment.id<=0||(attachment.subjectType!=L"task"&&attachment.subjectType!=L"ticket"))return false;
+    const std::string id=StableSyncObjectId(L"attachment",attachment.id),subjectId=StableSyncObjectId(attachment.subjectType,attachment.subjectId),uploaderId=StableSyncObjectId(L"employee",attachment.uploadedBy);if(id.empty()||subjectId.empty()||uploaderId.empty())return false;
+    int64_t baseCursor=0;
+    if(std::string(topic)=="attachment.archived"){std::ifstream cursor(FindWorkspaceRoot()/L"KR_BUILD"/L"sync-cursor.txt");if(!(cursor>>baseCursor)||baseCursor<0)baseCursor=0;}
+    const std::string payload="{\"id\":"+JsonString(std::wstring(id.begin(),id.end()))+",\"subjectType\":"+JsonString(attachment.subjectType)+",\"subjectId\":"+JsonString(std::wstring(subjectId.begin(),subjectId.end()))+",\"originalName\":"+JsonString(attachment.originalName)+",\"sizeBytes\":"+std::to_string(attachment.sizeBytes)+",\"sha256\":"+JsonString(attachment.sha256)+",\"uploadedBy\":"+JsonString(std::wstring(uploaderId.begin(),uploaderId.end()))+",\"active\":"+(attachment.active?"true":"false")+(std::string(topic)=="attachment.archived"?",\"baseCursor\":"+std::to_string(baseCursor):"")+"}";
+    if(std::string(topic)=="attachment.created")return g_SyncService.publishAttachment(attachment.storedPath,payload);
+    return g_SyncService.publish(topic,payload);
 }
 
 bool ReadJsonString(const std::string& text, size_t& position, std::string& value) {
@@ -542,7 +773,125 @@ bool JsonBooleanField(const std::string& text, const char* key, bool& value) {
     size_t position=0;if(!JsonValuePosition(text,key,0,position))return false;while(position<text.size()&&std::isspace(static_cast<unsigned char>(text[position])))++position;if(text.compare(position,4,"true")==0){value=true;return true;}if(text.compare(position,5,"false")==0){value=false;return true;}return false;
 }
 
-bool ApplyIncomingRoomChanges(const std::string& batch) {
+void ShowAttachmentArchiveConflict(HWND hwnd) {
+    std::string review;
+    if(!g_SyncService.inspectAttachmentArchive(review)){MessageBoxW(hwnd,L"Der erste Warteschlangeneintrag ist kein unterstützter Anhangskonflikt oder der Serverstand ist nicht verfügbar. Bitte Verbindung und Berechtigungen prüfen.",L"Anhangskonflikt",MB_ICONWARNING);return;}
+    size_t position=0;std::string topic,payload,name,id;bool active=false;
+    if(!JsonValuePosition(review,"projection",0,position)||!JsonStringField(review,"topic",topic,position)||!JsonStringField(review,"payload",payload,position)||!JsonStringField(payload,"originalName",name)||!JsonStringField(payload,"id",id)||!JsonBooleanField(payload,"active",active)){MessageBoxW(hwnd,L"Der Serverstand konnte nicht gelesen werden.",L"Anhangskonflikt",MB_ICONERROR);return;}
+    const std::wstring detail=L"Anhang: "+Utf8ToWide(name)+L"\nKennung: "+Utf8ToWide(id)+L"\nServerstand: "+(active?L"aktiv":L"archiviert")+L"\n\nDie ausstehende lokale Archivierung verwerfen und den angezeigten Serverstand übernehmen? Weitere ausstehende Änderungen an diesem Anhang verhindern die Übernahme.";
+    if(MessageBoxW(hwnd,detail.c_str(),L"Anhangskonflikt prüfen",MB_ICONQUESTION|MB_YESNO)!=IDYES)return;
+    if(!g_SyncService.prepareAttachmentArchive(review)){MessageBoxW(hwnd,L"Die Operation konnte nicht gesperrt werden. Serverstand, Warteschlange oder Berechtigungen haben sich möglicherweise geändert.",L"Anhangskonflikt",MB_ICONWARNING);return;}
+    const std::string batch="[{\"topic\":"+JsonString(Utf8ToWide(topic))+",\"payload\":"+JsonString(Utf8ToWide(payload))+"}]";
+    if(!ApplyIncomingRoomChanges(batch,false,false)){MessageBoxW(hwnd,L"Der Serverstand konnte lokal nicht übernommen werden. Die Warteschlange bleibt erhalten; die Prüfung kann erneut gestartet werden.",L"Anhangskonflikt",MB_ICONERROR);return;}
+    if(!g_SyncService.abandonAttachmentArchive(review)){MessageBoxW(hwnd,L"Der Serverstand wurde lokal übernommen, aber die Warteschlange konnte noch nicht bestätigt werden. Bitte die Prüfung erneut starten.",L"Anhangskonflikt",MB_ICONWARNING);return;}
+    MessageBoxW(hwnd,L"Die lokale Archivierung wurde verworfen und der Serverstand übernommen. Weitere Warteschlangeneinträge werden beim nächsten Abgleich übertragen.",L"Anhangskonflikt",MB_ICONINFORMATION);
+}
+
+bool DrainDesktopSubtasks() {
+    if(!g_Database || !g_Database->ready()) return false;
+    const DWORD size=GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0);if(size<=1)return false;
+    std::wstring server(size,L'\0');if(!GetEnvironmentVariableW(L"AURA_SYNC_URL",server.data(),size))return false;server.resize(wcslen(server.c_str()));while(!server.empty()&&server.back()==L'/')server.pop_back();if(server.empty())return false;
+    int64_t actor=0,emptyAccount=0;if(!g_SyncService.subtaskContext("",actor,emptyAccount)||actor<=0||emptyAccount!=0)return false;
+    for(int limit=0;limit<100;++limit){
+        std::wstring operation,action,id,value,expected,wire;
+        if(!g_Database->nextDesktopSubtaskOperation(operation,action,id,value,expected,wire))return false;
+        if(operation.empty())return true;
+        if(wire.empty()){
+            auto convert=[&](const std::wstring& local,std::string& result,std::wstring& employeeKey)->bool{
+                const std::string json=WideToUtf8(local);std::string title,status;int64_t task=0,assignee=0,due=0;bool active=false;
+                if(!JsonIntegerField(json,"taskId",task)||!JsonIntegerField(json,"assigneeId",assignee)||!JsonIntegerField(json,"dueAt",due)||!JsonStringField(json,"title",title)||!JsonStringField(json,"status",status)||!JsonBooleanField(json,"active",active)||task<=0||assignee<0||due<0)return false;
+                const std::wstring taskKey=g_Database->syncedExternalId(L"task",task);if(taskKey.empty())return false;
+                employeeKey=assignee?g_Database->syncedExternalId(L"employee",assignee):L"";if(assignee&&employeeKey.empty())return false;
+                int64_t mappedActor=0,account=0;if(!g_SyncService.subtaskContext(WideToUtf8(employeeKey),mappedActor,account)||mappedActor!=actor||(!assignee&&account!=0)||(assignee&&account<=0))return false;
+                result="{\"id\":"+JsonString(id)+",\"taskId\":"+JsonString(taskKey)+",\"title\":"+JsonString(Utf8ToWide(title))+",\"status\":"+JsonString(Utf8ToWide(status))+",\"assigneeId\":"+std::to_string(account)+",\"dueAt\":"+std::to_string(due)+",\"active\":"+(active?"true":"false")+"}";return true;
+            };
+            std::string item,base;std::wstring key,baseKey;
+            if(!convert(value,item,key))return false;
+            if(!expected.empty()&&!convert(expected,base,baseKey))return false;
+            std::string payload="{\"clientId\":"+JsonString(g_SyncService.clientId())+",\"operationId\":"+JsonString(operation)+",\"action\":"+JsonString(action)+",\"subtask\":"+item+",\"expected\":"+(expected.empty()?"null":base)+",\"assigneeEmployeeId\":"+JsonString(key);
+            if(!expected.empty())payload+=",\"expectedAssigneeEmployeeId\":"+JsonString(baseKey);
+            payload+="}";wire=Utf8ToWide(payload);
+        }
+        if(!g_Database->freezeDesktopSubtaskOperation(operation,server,actor,wire))return false;
+        if(!g_SyncService.sendSubtask(WideToUtf8(wire)))return false;
+        if(!g_Database->acknowledgeDesktopSubtaskOperation(operation,server,actor,wire,L"sync.desktop"))return false;
+    }
+    return true;
+}
+
+bool DrainDesktopDependencies() {
+    if(!g_Database||!g_Database->ready())return false;
+    const DWORD size=GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0);if(size<=1)return false;
+    std::wstring server(size,L'\0');if(!GetEnvironmentVariableW(L"AURA_SYNC_URL",server.data(),size))return false;server.resize(wcslen(server.c_str()));while(!server.empty()&&server.back()==L'/')server.pop_back();if(server.empty())return false;
+    int64_t actor=0,emptyAccount=0;if(!g_SyncService.subtaskContext("",actor,emptyAccount)||actor<=0||emptyAccount!=0)return false;
+    for(int limit=0;limit<100;++limit){
+        std::wstring operation,wire;int64_t task=0,dependency=0;bool present=false,expected=false;
+        if(!g_Database->nextDesktopDependencyOperation(operation,task,dependency,present,expected,wire))return false;
+        if(operation.empty())return true;
+        if(wire.empty()){
+            const std::wstring taskKey=g_Database->syncedExternalId(L"task",task),dependencyKey=g_Database->syncedExternalId(L"task",dependency);
+            if(taskKey.empty()||dependencyKey.empty())return false;
+            wire=Utf8ToWide("{\"clientId\":"+JsonString(g_SyncService.clientId())+",\"operationId\":"+JsonString(operation)+",\"taskId\":"+JsonString(taskKey)+",\"dependencyId\":"+JsonString(dependencyKey)+",\"present\":"+(present?"true":"false")+",\"expected\":"+(expected?"true":"false")+"}");
+        }
+        if(!g_Database->freezeDesktopDependencyOperation(operation,server,actor,wire))return false;
+        if(!g_SyncService.sendDependency(WideToUtf8(wire)))return false;
+        if(!g_Database->acknowledgeDesktopDependencyOperation(operation,server,actor,wire,L"sync.desktop"))return false;
+    }
+    return true;
+}
+
+bool DrainDesktopProjectAssignments() {
+    if(!g_Database||!g_Database->ready())return false;
+    const DWORD size=GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0);if(size<=1)return false;
+    std::wstring server(size,L'\0');if(!GetEnvironmentVariableW(L"AURA_SYNC_URL",server.data(),size))return false;server.resize(wcslen(server.c_str()));while(!server.empty()&&server.back()==L'/')server.pop_back();if(server.empty())return false;
+    int64_t actor=0,emptyAccount=0;if(!g_SyncService.subtaskContext("",actor,emptyAccount)||actor<=0||emptyAccount!=0)return false;
+    for(int limit=0;limit<100;++limit){
+        std::wstring operation,wire;int64_t project=0,task=0;bool present=false,expected=false;
+        if(!g_Database->nextDesktopProjectAssignmentOperation(operation,project,task,present,expected,wire))return false;
+        if(operation.empty())return true;
+        if(wire.empty()){
+            const std::wstring projectKey=g_Database->syncedExternalId(L"project",project),taskKey=g_Database->syncedExternalId(L"task",task);
+            if(projectKey.empty()||taskKey.empty())return false;
+            wire=Utf8ToWide("{\"clientId\":"+JsonString(g_SyncService.clientId())+",\"operationId\":"+JsonString(operation)+",\"projectId\":"+JsonString(projectKey)+",\"taskId\":"+JsonString(taskKey)+",\"present\":"+(present?"true":"false")+",\"expected\":"+(expected?"true":"false")+"}");
+        }
+        if(!g_Database->freezeDesktopProjectAssignmentOperation(operation,server,actor,wire))return false;
+        if(!g_SyncService.sendProjectAssignment(WideToUtf8(wire)))return false;
+        if(!g_Database->acknowledgeDesktopProjectAssignmentOperation(operation,server,actor,wire,L"sync.desktop"))return false;
+    }
+    return true;
+}
+
+bool DrainDesktopTaskRecurrences() {
+    if(!g_Database || !g_Database->ready())return false;
+    const DWORD size=GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0);if(size<=1)return false;
+    std::wstring server(size,L'\0');if(!GetEnvironmentVariableW(L"AURA_SYNC_URL",server.data(),size))return false;server.resize(wcslen(server.c_str()));while(!server.empty()&&server.back()==L'/')server.pop_back();if(server.empty())return false;
+    int64_t actor=0,empty=0;if(!g_SyncService.subtaskContext("",actor,empty)||actor<=0||empty!=0)return false;
+    std::vector<std::tuple<int64_t,std::wstring,std::wstring>> links;
+    if(!g_Database->desktopTaskRecurrenceLinks(g_SyncService.clientId(),server,actor,links))return false;
+    for(const auto& [auditId,source,successor]:links) {
+        const std::wstring operation=L"recurrence-"+std::to_wstring(auditId);
+        const std::string payload="{\"clientId\":"+JsonString(g_SyncService.clientId())+",\"operationId\":"+JsonString(operation)+",\"sourceId\":"+JsonString(source)+",\"successorId\":"+JsonString(successor)+"}";
+        if(!g_SyncService.sendTaskRecurrence(payload))return false;
+    }
+    return true;
+}
+
+bool DrainDesktopMaintenanceRecurrences() {
+    if(!g_Database || !g_Database->ready())return false;
+    const DWORD size=GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0);if(size<=1)return false;
+    std::wstring server(size,L'\0');if(!GetEnvironmentVariableW(L"AURA_SYNC_URL",server.data(),size))return false;server.resize(wcslen(server.c_str()));while(!server.empty()&&server.back()==L'/')server.pop_back();if(server.empty())return false;
+    int64_t actor=0,empty=0;if(!g_SyncService.subtaskContext("",actor,empty)||actor<=0||empty!=0)return false;
+    std::vector<std::tuple<int64_t,std::wstring,std::wstring>> links;
+    if(!g_Database->desktopMaintenanceRecurrenceLinks(g_SyncService.clientId(),server,actor,links))return false;
+    for(const auto& [auditId,source,successor]:links) {
+        const std::wstring operation=L"maintenance-recurrence-"+std::to_wstring(auditId);
+        const std::string payload="{\"clientId\":"+JsonString(g_SyncService.clientId())+",\"operationId\":"+JsonString(operation)+",\"sourceId\":"+JsonString(source)+",\"successorId\":"+JsonString(successor)+"}";
+        if(!g_SyncService.sendMaintenanceRecurrence(payload))return false;
+    }
+    return true;
+}
+
+bool ApplyIncomingRoomChanges(const std::string& batch, bool skipBookingEvents, bool skipProjectAssignments, bool* attachmentChanged) {
     g_SyncApplyError.clear();
     if (!g_Database || !g_Database->ready() || batch == "[]") return g_Database && g_Database->ready();
     const std::string ownPrefix = WideToUtf8(g_SyncService.clientId()) + ":"; size_t searchAt=0;
@@ -551,21 +900,66 @@ bool ApplyIncomingRoomChanges(const std::string& batch) {
         if(!JsonStringField(batch,"topic",topic,topicAt)||!JsonStringField(batch,"payload",payload,topicAt)){g_SyncApplyError="Cursor-Ereignis konnte nicht gelesen werden";return false;}
         g_SyncApplyError="Cursor-Ereignis wird verarbeitet: "+topic;
         searchAt=topicAt+7;
-        if(topic!="room.created"&&topic!="room.updated"&&topic!="room.archived"&&topic!="project.created"&&topic!="project.updated"&&topic!="project.archived"&&topic!="task.created"&&topic!="task.updated"&&topic!="task.status.changed"&&topic!="task.archived"&&topic!="task.approval.requested"&&topic!="task.approval.decided"&&topic!="comment.created"&&topic!="attachment.created"&&topic!="attachment.archived"&&topic!="ticket.created"&&topic!="ticket.updated"&&topic!="ticket.status.changed"&&topic!="ticket.archived"&&topic!="employee.created"&&topic!="employee.updated"&&topic!="employee.presence.changed"&&topic!="employee.archived"&&topic!="organization.created"&&topic!="organization.updated"&&topic!="organization.archived"&&topic!="leave.requested"&&topic!="leave.decided"&&topic!="facility.asset.created"&&topic!="facility.asset.updated"&&topic!="facility.asset.archived"&&topic!="facility.maintenance.created"&&topic!="facility.maintenance.updated"&&topic!="facility.maintenance.status.changed"&&topic!="facility.maintenance.archived")continue;
+        if(topic=="booking.created"||topic=="booking.rescheduled"||topic=="booking.cancelled") {
+            if(skipBookingEvents)continue;
+            std::string source,room,status,reason;int64_t remote=0,start=0,end=0,attendees=0;
+            // Legacy events without a device identity cannot be mapped to a local row.
+            if(!JsonStringField(payload,"clientId",source)||source.empty())continue;
+            if(!JsonIntegerField(payload,"bookingId",remote)||remote<=0){g_SyncApplyError="Buchungsereignis ohne eindeutige Kennung";return false;}
+            if(source==WideToUtf8(g_SyncService.clientId()))continue;
+            if(topic=="booking.cancelled"){
+                if(!g_Database->cancelSyncedBooking(Utf8ToWide(source),remote,L"sync.remote")){g_SyncApplyError="Buchungsstornierung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+                continue;
+            }
+            // Historical bookings without a shared room ID cannot be mapped safely.
+            if(!JsonStringField(payload,"roomKey",room)||room.empty())continue;
+            if(!JsonIntegerField(payload,"startsAt",start)||!JsonIntegerField(payload,"endsAt",end)){g_SyncApplyError="Buchungsereignis ohne Zeitraum";return false;}
+            JsonIntegerField(payload,"attendees",attendees);if(attendees==0)attendees=1;
+            JsonStringField(payload,"status",status);if(status.empty())status="confirmed";
+            JsonStringField(payload,"reason",reason);
+            if(attendees<1||attendees>2147483647){g_SyncApplyError="Ungültige Teilnehmerzahl";return false;}
+            EnterpriseBooking booking{0,0,0,start,end,static_cast<int>(attendees),Utf8ToWide(status)};
+            if(!g_Database->applySyncedBooking(Utf8ToWide(source),remote,Utf8ToWide(room),booking,Utf8ToWide(reason),L"sync.remote")){g_SyncApplyError="Buchung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+            continue;
+        }
+        if(topic=="central.project_assignment.added"||topic=="central.project_assignment.removed") {
+            if(skipProjectAssignments)continue;
+            std::string project,task;
+            if(!JsonStringField(payload,"projectId",project)||!JsonStringField(payload,"taskId",task)||!g_Database->applySyncedProjectAssignment(Utf8ToWide(project),Utf8ToWide(task),topic=="central.project_assignment.added",L"sync.remote")){g_SyncApplyError="Projektzuordnung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+            continue;
+        }
+        if(topic=="central.task_recurrence.linked") {
+            std::string source,successor;
+            if(!JsonStringField(payload,"sourceId",source)||!JsonStringField(payload,"successorId",successor)||!g_Database->applySyncedTaskRecurrence(Utf8ToWide(source),Utf8ToWide(successor),L"sync.remote")){g_SyncApplyError="Folgeaufgabenzuordnung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+            continue;
+        }
+        if(topic=="central.maintenance_recurrence.linked") {
+            std::string source,successor;
+            if(!JsonStringField(payload,"sourceId",source)||!JsonStringField(payload,"successorId",successor)||!g_Database->applySyncedMaintenanceRecurrence(Utf8ToWide(source),Utf8ToWide(successor),L"sync.remote")){g_SyncApplyError="Folgewartungszuordnung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+            continue;
+        }
+        if(topic=="central.task_dependency.added"||topic=="central.task_dependency.removed") {
+            std::string task,dependency;
+            if(!JsonStringField(payload,"taskId",task)||!JsonStringField(payload,"dependencyId",dependency)||!g_Database->applySyncedTaskDependency(Utf8ToWide(task),Utf8ToWide(dependency),topic=="central.task_dependency.added",L"sync.remote")){g_SyncApplyError="Voraussetzung konnte nicht übernommen werden: "+WideToUtf8(g_Database->error());return false;}
+            continue;
+        }
+        if(topic!="central.task_subtask.saved"&&topic!="central.task_subtask.archived"&&topic!="room.created"&&topic!="room.updated"&&topic!="room.archived"&&topic!="project.created"&&topic!="project.updated"&&topic!="project.archived"&&topic!="task.created"&&topic!="task.updated"&&topic!="task.status.changed"&&topic!="task.archived"&&topic!="task.approval.requested"&&topic!="task.approval.decided"&&topic!="comment.created"&&topic!="attachment.created"&&topic!="attachment.archived"&&topic!="attachment.restored"&&topic!="ticket.created"&&topic!="ticket.updated"&&topic!="ticket.status.changed"&&topic!="ticket.archived"&&topic!="employee.created"&&topic!="employee.updated"&&topic!="employee.presence.changed"&&topic!="employee.archived"&&topic!="organization.created"&&topic!="organization.updated"&&topic!="organization.archived"&&topic!="leave.requested"&&topic!="leave.decided"&&topic!="facility.asset.created"&&topic!="facility.asset.updated"&&topic!="facility.asset.archived"&&topic!="facility.maintenance.created"&&topic!="facility.maintenance.updated"&&topic!="facility.maintenance.status.changed"&&topic!="facility.maintenance.archived")continue;
         std::string id; if(!JsonStringField(payload,"id",id)){g_SyncApplyError="Cursor-Ereignis enthält keine Objekt-ID: "+topic;return false;}
-        if(!ownPrefix.empty()&&id.rfind(ownPrefix,0)==0)continue;
+        // Decisions from another client can concern our own original request.
+        if(!ownPrefix.empty()&&id.rfind(ownPrefix,0)==0&&topic.rfind("leave.",0)!=0&&topic.rfind("task.approval.",0)!=0&&!(topic.rfind("attachment.",0)==0&&g_SyncService.supportsAttachmentProtocol()))continue;
         bool active=true; if(!JsonBooleanField(payload,"active",active) && topic.rfind("leave.",0)!=0 && topic!="comment.created"){g_SyncApplyError="Cursor-Ereignis enthält kein aktives Flag: "+topic+" payload="+payload;return false;}
-        if(topic.rfind("facility.maintenance.",0)==0){std::string assetId,title,status;int64_t dueAt=0,recurrenceDays=0;if(!JsonStringField(payload,"assetId",assetId)||!JsonStringField(payload,"title",title)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"dueAt",dueAt)||!JsonIntegerField(payload,"recurrenceDays",recurrenceDays))return false;EnterpriseMaintenanceOrder order{0,0,Utf8ToWide(title),Utf8ToWide(status),dueAt,static_cast<int>(recurrenceDays),active};if(!g_Database->applySyncedMaintenanceOrder(Utf8ToWide(id),Utf8ToWide(assetId),order,L"sync.remote"))return false;}
+        if(topic=="central.task_subtask.saved"||topic=="central.task_subtask.archived"){std::string taskId,title,status,assignee;int64_t due=0,account=0;if(!JsonStringField(payload,"taskId",taskId)||!JsonStringField(payload,"title",title)||!JsonStringField(payload,"status",status)||!JsonStringField(payload,"assigneeEmployeeId",assignee)||!JsonIntegerField(payload,"assigneeId",account)||!JsonIntegerField(payload,"dueAt",due)||account<0||(account>0&&assignee.empty())||(account==0&&!assignee.empty()))return false;EnterpriseSubtask sub{0,0,Utf8ToWide(title),Utf8ToWide(status),0,due,active};if(!g_Database->applySyncedSubtask(Utf8ToWide(id),Utf8ToWide(taskId),Utf8ToWide(assignee),sub,L"sync.remote"))return false;}
+        else if(topic.rfind("facility.maintenance.",0)==0){std::string assetId,title,status;int64_t dueAt=0,recurrenceDays=0;if(!JsonStringField(payload,"assetId",assetId)||!JsonStringField(payload,"title",title)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"dueAt",dueAt)||!JsonIntegerField(payload,"recurrenceDays",recurrenceDays))return false;EnterpriseMaintenanceOrder order{0,0,Utf8ToWide(title),Utf8ToWide(status),dueAt,static_cast<int>(recurrenceDays),active};if(!g_Database->applySyncedMaintenanceOrder(Utf8ToWide(id),Utf8ToWide(assetId),order,L"sync.remote"))return false;}
         else if(topic.rfind("facility.asset.",0)==0){std::string name,category,location,status;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"category",category)||!JsonStringField(payload,"location",location)||!JsonStringField(payload,"status",status))return false;EnterpriseFacilityAsset asset{0,Utf8ToWide(name),Utf8ToWide(category),Utf8ToWide(location),Utf8ToWide(status),active};if(!g_Database->applySyncedFacilityAsset(Utf8ToWide(id),asset,L"sync.remote"))return false;}
-        else if(topic.rfind("leave.",0)==0){int64_t employeeId=0,startsAt=0,endsAt=0,decidedBy=0;std::string reason,status;if(!JsonIntegerField(payload,"employeeId",employeeId)||!JsonIntegerField(payload,"startsAt",startsAt)||!JsonIntegerField(payload,"endsAt",endsAt)||!JsonStringField(payload,"reason",reason)||!JsonStringField(payload,"status",status))return false;JsonIntegerField(payload,"decidedBy",decidedBy);EnterpriseLeaveRequest leave{0,employeeId,startsAt,endsAt,Utf8ToWide(reason),Utf8ToWide(status),decidedBy,active};if(!g_Database->applySyncedLeaveRequest(Utf8ToWide(id),leave,L"sync.remote"))return false;}
+        else if(topic.rfind("leave.",0)==0){int64_t account=0,startsAt=0,endsAt=0,deciderAccount=0;std::string reason,status,employeeExternal,deciderExternal;if(!JsonIntegerField(payload,"employeeId",account)||!JsonIntegerField(payload,"startsAt",startsAt)||!JsonIntegerField(payload,"endsAt",endsAt)||!JsonStringField(payload,"reason",reason)||!JsonStringField(payload,"status",status)||!JsonStringField(payload,"employeeExternalId",employeeExternal)||!JsonStringField(payload,"deciderExternalId",deciderExternal)){g_SyncApplyError="Urlaubsereignis ohne eindeutige Mitarbeiterzuordnung";return false;}JsonIntegerField(payload,"decidedBy",deciderAccount);const int64_t employeeId=g_Database->syncedLocalId(L"employee",Utf8ToWide(employeeExternal)),decidedBy=deciderExternal.empty()?0:g_Database->syncedLocalId(L"employee",Utf8ToWide(deciderExternal));if(account<=0||employeeId<=0||(deciderAccount>0&&decidedBy<=0)||(deciderAccount==0&&decidedBy!=0)){g_SyncApplyError="Urlaubsantrag: Mitarbeiterkonto ist nicht eindeutig zugeordnet";return false;}EnterpriseLeaveRequest leave{0,employeeId,startsAt,endsAt,Utf8ToWide(reason),Utf8ToWide(status),decidedBy,active};if(!g_Database->applySyncedLeaveRequest(Utf8ToWide(id),leave,L"sync.remote"))return false;}
         else if(topic.rfind("organization.",0)==0){std::string name,code;int64_t managerId=0;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"code",code)||!JsonIntegerField(payload,"managerId",managerId))return false;EnterpriseOrganizationUnit unit{0,Utf8ToWide(name),Utf8ToWide(code),managerId,active};if(!g_Database->applySyncedOrganizationUnit(Utf8ToWide(id),unit,L"sync.remote"))return false;}
         else if(topic.rfind("employee.",0)==0){std::string name,role,department,presence;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"role",role)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"presence",presence))return false;EnterpriseEmployee employee{0,Utf8ToWide(name),Utf8ToWide(role),Utf8ToWide(department),Utf8ToWide(presence),active};if(!g_Database->applySyncedEmployee(Utf8ToWide(id),employee,L"sync.remote"))return false;}
         else if(topic.rfind("room.",0)==0){std::string name,location,equipment;int64_t capacity=0;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"location",location)||!JsonStringField(payload,"equipment",equipment)||!JsonIntegerField(payload,"capacity",capacity))return false;EnterpriseRoom room{0,Utf8ToWide(name),Utf8ToWide(location),static_cast<int>(capacity),Utf8ToWide(equipment),active};if(!g_Database->applySyncedRoom(Utf8ToWide(id),room,L"sync.remote"))return false;}
         else if(topic.rfind("project.",0)==0) {std::string name,department,description,status;int64_t ownerId=0;if(!JsonStringField(payload,"name",name)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"description",description)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"ownerId",ownerId)){g_SyncApplyError="Projektereignis enthält unvollständige Felder: "+payload;return false;}EnterpriseProject project{0,Utf8ToWide(name),Utf8ToWide(department),Utf8ToWide(description),Utf8ToWide(status),ownerId,active};if(!g_Database->applySyncedProject(Utf8ToWide(id),project,L"sync.remote")){g_SyncApplyError="Projektübernahme fehlgeschlagen: "+WideToUtf8(g_Database->error());return false;}}
-        else if(topic.rfind("attachment.",0)==0){std::string subjectType,subjectId,originalName,sha256,uploadedBy;int64_t sizeBytes=0;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"originalName",originalName)||!JsonStringField(payload,"sha256",sha256)||!JsonStringField(payload,"uploadedBy",uploadedBy)||!JsonIntegerField(payload,"sizeBytes",sizeBytes))return false;const int64_t localSubject=g_Database->syncedLocalId(Utf8ToWide(subjectType),Utf8ToWide(subjectId));if(localSubject<=0)return false;const std::filesystem::path localPath=FindWorkspaceRoot()/L"KR_BUILD"/L"attachments"/Utf8ToWide(subjectType)/std::to_wstring(localSubject)/(L"remote_"+Utf8ToWide(sha256));EnterpriseAttachment attachment{0,Utf8ToWide(subjectType),0,Utf8ToWide(originalName),localPath.wstring(),sizeBytes,Utf8ToWide(sha256),0,L"",active};if(!g_Database->applySyncedAttachment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(uploadedBy),attachment,L"sync.remote"))return false;}
-        else if(topic=="comment.created"){std::string subjectType,subjectId,authorId,body;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"authorId",authorId)||!JsonStringField(payload,"body",body))return false;EnterpriseComment comment{0,Utf8ToWide(subjectType),0,0,Utf8ToWide(body),L""};if(!g_Database->applySyncedComment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(authorId),comment,L"sync.remote"))return false;}
+        else if(topic.rfind("attachment.",0)==0){std::string subjectType,subjectId,originalName,sha256,uploadedBy;int64_t sizeBytes=0;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"originalName",originalName)||!JsonStringField(payload,"sha256",sha256)||!JsonStringField(payload,"uploadedBy",uploadedBy)||!JsonIntegerField(payload,"sizeBytes",sizeBytes))return false;const int64_t localSubject=g_Database->syncedLocalId(Utf8ToWide(subjectType),Utf8ToWide(subjectId));if(localSubject<=0)return false;const std::filesystem::path localPath=FindWorkspaceRoot()/L"KR_BUILD"/L"attachments"/Utf8ToWide(subjectType)/std::to_wstring(localSubject)/(L"remote_"+Utf8ToWide(sha256));EnterpriseAttachment attachment{0,Utf8ToWide(subjectType),0,Utf8ToWide(originalName),localPath.wstring(),sizeBytes,Utf8ToWide(sha256),0,L"",active};bool changed=false;if(!g_Database->applySyncedAttachment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(uploadedBy),attachment,L"sync.remote",&changed))return false;if(attachmentChanged&&changed)*attachmentChanged=true;}
+        else if(topic=="comment.created"){std::string subjectType,subjectId,authorId,body,createdAt;if(!JsonStringField(payload,"subjectType",subjectType)||!JsonStringField(payload,"subjectId",subjectId)||!JsonStringField(payload,"authorId",authorId)||!JsonStringField(payload,"body",body))return false;JsonStringField(payload,"createdAt",createdAt);EnterpriseComment comment{0,Utf8ToWide(subjectType),0,0,Utf8ToWide(body),Utf8ToWide(createdAt)};if(!g_Database->applySyncedComment(Utf8ToWide(id),Utf8ToWide(subjectId),Utf8ToWide(authorId),comment,L"sync.remote"))return false;}
         else if(topic.rfind("task.approval.",0)==0){std::string taskId,requestedBy,approverId,status,decidedBy;if(!JsonStringField(payload,"taskId",taskId)||!JsonStringField(payload,"requestedBy",requestedBy)||!JsonStringField(payload,"approverId",approverId)||!JsonStringField(payload,"status",status)||!JsonStringField(payload,"decidedBy",decidedBy))return false;EnterpriseTaskApproval approval{0,0,0,0,Utf8ToWide(status),0,active};if(!g_Database->applySyncedTaskApproval(Utf8ToWide(id),Utf8ToWide(taskId),Utf8ToWide(requestedBy),Utf8ToWide(approverId),Utf8ToWide(decidedBy),approval,L"sync.remote"))return false;}
-        else if(topic.rfind("task.",0)==0) {std::string title,department,priority,status;int64_t assignee=0;if(!JsonStringField(payload,"title",title)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"priority",priority)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"assigneeId",assignee))return false;EnterpriseTask task{0,Utf8ToWide(title),Utf8ToWide(department),Utf8ToWide(priority),Utf8ToWide(status),assignee,active};if(!g_Database->applySyncedTask(Utf8ToWide(id),task,L"sync.remote"))return false;}
+        else if(topic.rfind("task.",0)==0) {std::string title,department,priority,status;int64_t assignee=0,dueAt=0,recurrenceDays=0;if(!JsonStringField(payload,"title",title)||!JsonStringField(payload,"department",department)||!JsonStringField(payload,"priority",priority)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"assigneeId",assignee))return false;const bool hasDue=JsonIntegerField(payload,"dueAt",dueAt),hasRecurrence=JsonIntegerField(payload,"recurrenceDays",recurrenceDays);if(hasDue!=hasRecurrence || (hasDue && (dueAt<0 || recurrenceDays<0 || recurrenceDays>3660)))return false;EnterpriseTask task{0,Utf8ToWide(title),Utf8ToWide(department),Utf8ToWide(priority),Utf8ToWide(status),assignee,active,dueAt,static_cast<int>(recurrenceDays)};if(!g_Database->applySyncedTask(Utf8ToWide(id),task,L"sync.remote",hasDue))return false;}
         else {std::string title,category,priority,status;int64_t assignee=0;if(!JsonStringField(payload,"title",title)||!JsonStringField(payload,"category",category)||!JsonStringField(payload,"priority",priority)||!JsonStringField(payload,"status",status)||!JsonIntegerField(payload,"assigneeId",assignee))return false;EnterpriseTicket ticket{0,Utf8ToWide(title),Utf8ToWide(category),Utf8ToWide(priority),Utf8ToWide(status),assignee,active};if(!g_Database->applySyncedTicket(Utf8ToWide(id),ticket,L"sync.remote"))return false;}
     }
     return true;
@@ -578,6 +972,12 @@ bool HasEnterprisePermission(const std::wstring& permission) {
 bool RequireEnterprisePermission(HWND owner, const std::wstring& permission) {
     if (HasEnterprisePermission(permission)) return true;
     MessageBoxW(owner, (L"Für diese Aktion fehlt die Berechtigung: " + permission).c_str(), L"Zugriff verweigert", MB_ICONWARNING);
+    return false;
+}
+
+bool RequireLeaveApprovalPermission(HWND owner) {
+    if (HasEnterprisePermission(L"leave.approve") || HasEnterprisePermission(L"employees.manage")) return true;
+    MessageBoxW(owner,L"Für diese Aktion fehlt die Berechtigung: leave.approve",L"Zugriff verweigert",MB_ICONWARNING);
     return false;
 }
 
@@ -948,6 +1348,7 @@ constexpr int IDC_ATTACHMENT_ADD = 6342;
 constexpr int IDC_ATTACHMENT_OPEN = 6343;
 constexpr int IDC_ATTACHMENT_ARCHIVE = 6344;
 constexpr int IDC_ATTACHMENT_CLOSE = 6345;
+constexpr int IDC_ATTACHMENT_RETRY = 6346;
 constexpr int IDC_SUBTASK_SAVE = 6336;
 constexpr int IDC_SUBTASK_NEW = 6337;
 constexpr int IDC_SUBTASK_ARCHIVE = 6338;
@@ -1147,7 +1548,7 @@ LRESULT CALLBACK SubtaskManagerProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 }
 void ShowSubtaskManager(HWND owner,const EnterpriseTask& task){auto* context=new SubtaskManagerContext{owner,task};EnableWindow(owner,FALSE);if(!CreateWindowExW(WS_EX_DLGMODALFRAME,L"AuraSubtaskManager",L"Unteraufgaben",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,630,355,owner,nullptr,GetModuleHandleW(nullptr),context)){EnableWindow(owner,TRUE);delete context;}}
 
-struct TaskEditorContext { HWND owner = nullptr; EnterpriseTask task; bool editing = false; int64_t projectId = 0; std::vector<EnterpriseProject> projects; };
+struct TaskEditorContext { HWND owner = nullptr; EnterpriseTask task; bool editing = false; int64_t projectId = 0; std::vector<EnterpriseProject> projects; bool multipleProjects = false; };
 void ShowAttachmentManager(HWND owner, const std::wstring& subjectType, int64_t subjectId, const std::wstring& subjectTitle);
 
 LRESULT CALLBACK TaskEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1156,13 +1557,14 @@ LRESULT CALLBACK TaskEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_NCCREATE:
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams)); return TRUE;
     case WM_CREATE: {
-        context = reinterpret_cast<TaskEditorContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)); SetWindowTextW(hwnd, context && context->editing ? L"Aufgabe bearbeiten" : L"Neue Aufgabe anlegen"); if (g_Database) { context->projects = g_Database->projects(); if(context->editing) for(const EnterpriseProject& item:context->projects) for(const EnterpriseTask& linked:g_Database->tasksForProject(item.id)) if(linked.id==context->task.id){context->projectId=item.id;break;} }
+        context = reinterpret_cast<TaskEditorContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)); SetWindowTextW(hwnd, context && context->editing ? L"Aufgabe bearbeiten" : L"Neue Aufgabe anlegen"); if (g_Database) { context->projects = g_Database->projects(); if(context->editing) { int count=0; for(const EnterpriseProject& item:g_Database->projects(true)) for(const EnterpriseTask& linked:g_Database->tasksForProject(item.id)) if(linked.id==context->task.id){++count;context->projectId=item.id;break;} context->multipleProjects=count>1; } }
         RoomEditorLabel(hwnd, L"Titel *", 22, 24); RoomEditorLabel(hwnd, L"Bereich *", 22, 72); RoomEditorLabel(hwnd, L"Priorität *", 22, 120); RoomEditorLabel(hwnd, L"Projekt", 22, 168); RoomEditorLabel(hwnd, L"Fällig am (JJJJ-MM-TT SS:MM)", 22, 216); RoomEditorLabel(hwnd, L"Wiederholung (Tage, 0 = keine)", 22, 264);
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context ? context->task.title.c_str() : L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 22, 44, 390, 24, hwnd, reinterpret_cast<HMENU>(IDC_TASK_TITLE), nullptr, nullptr);
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context ? context->task.department.c_str() : L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 22, 92, 390, 24, hwnd, reinterpret_cast<HMENU>(IDC_TASK_DEPARTMENT), nullptr, nullptr);
         HWND priority = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 22, 140, 390, 150, hwnd, reinterpret_cast<HMENU>(IDC_TASK_PRIORITY), nullptr, nullptr);
         SendMessageW(priority, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Niedrig")); SendMessageW(priority, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Mittel")); SendMessageW(priority, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Hoch")); SendMessageW(priority, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Kritisch")); SendMessageW(priority, CB_SETCURSEL, context && context->task.priority == L"Niedrig" ? 0 : context && context->task.priority == L"Hoch" ? 2 : context && context->task.priority == L"Kritisch" ? 3 : 1, 0);
         HWND project = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 22, 188, 390, 150, hwnd, reinterpret_cast<HMENU>(IDC_TASK_PROJECT), nullptr, nullptr); SendMessageW(project, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Ohne Projekt")); int projectSelection=0; for(size_t index=0;index<context->projects.size();++index){const EnterpriseProject& item=context->projects[index];SendMessageW(project,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(item.name.c_str()));if(item.id==context->projectId)projectSelection=static_cast<int>(index+1);} SendMessageW(project,CB_SETCURSEL,projectSelection,0);
+        if(context->multipleProjects || (context->projectId && projectSelection==0))EnableWindow(project,FALSE);
         const std::wstring dueAt = context && context->task.dueAt > 0 ? FormatBookingDateTime(context->task.dueAt) : L"";
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", dueAt.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 22, 236, 390, 24, hwnd, reinterpret_cast<HMENU>(IDC_TASK_DUE_AT), nullptr, nullptr);
         CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(context ? context->task.recurrenceDays : 0).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER, 22, 284, 390, 24, hwnd, reinterpret_cast<HMENU>(IDC_TASK_RECURRENCE_DAYS), nullptr, nullptr);
@@ -1184,7 +1586,7 @@ LRESULT CALLBACK TaskEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const bool ok=context->editing?g_Database->updateTask(task,L"Ralf Krümmel"):g_Database->createTask(task, ignored, L"Ralf Krümmel"); if (!ok) { MessageBoxW(hwnd, g_Database->error().c_str(), L"Aufgabe konnte nicht gespeichert werden", MB_ICONERROR); return 0; } if(!context->editing)task.id=ignored;
             const int selection = static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_TASK_PROJECT), CB_GETCURSEL, 0, 0));
             const int64_t taskId=context->editing?task.id:ignored; const int64_t projectId=selection>0?context->projects[static_cast<size_t>(selection-1)].id:0;
-            if (!g_Database->setTaskProject(taskId, projectId, L"Ralf Krümmel")) { MessageBoxW(hwnd, g_Database->error().c_str(), L"Projektzuordnung", MB_ICONERROR); return 0; }
+            if (IsWindowEnabled(GetDlgItem(hwnd, IDC_TASK_PROJECT)) && !g_Database->setTaskProject(taskId, projectId, L"Ralf Krümmel")) { MessageBoxW(hwnd, g_Database->error().c_str(), L"Projektzuordnung", MB_ICONERROR); return 0; }
             PublishTaskChange(task,context->editing?"task.updated":"task.created");
             RefreshTasksFromDatabase(); InvalidateRect(context->owner, nullptr, FALSE); DestroyWindow(hwnd); return 0;
         }
@@ -1315,15 +1717,23 @@ bool AddAttachmentFromDialog(HWND hwnd, AttachmentManagerContext* context) {
     // endpoint the identical SHA-256 object is uploaded immediately. Metadata
     // is published only after that binary object exists centrally, so another
     // client never receives an attachment it cannot retrieve.
-    if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)>0){const int32_t transferred=g_SyncService.uploadAttachment(target.wstring());if(transferred!=0)MessageBoxW(hwnd,L"Der Anhang wurde lokal revisionssicher gespeichert, konnte aber noch nicht in die Zentrale übertragen werden.",L"Anhang-Synchronisation",MB_ICONWARNING);else{EnterpriseAttachment published=attachment;published.id=newId;PublishAttachmentChange(published,"attachment.created");}}
+    if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)>0){EnterpriseAttachment published=attachment;published.id=newId;if(!PublishAttachmentChange(published,"attachment.created"))MessageBoxW(hwnd,L"Der Anhang wurde lokal gespeichert. Die zentrale Übertragung wurde nicht bestätigt. Bitte Verbindung und Synchronisationswarteschlange prüfen.",L"Anhang-Synchronisation",MB_ICONWARNING);}
     RefreshAttachmentList(hwnd,context);return true;
 }
 
 LRESULT CALLBACK AttachmentManagerProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* context=reinterpret_cast<AttachmentManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(message){
     case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;
-    case WM_CREATE:{context=reinterpret_cast<AttachmentManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));SetWindowTextW(hwnd,(L"Anhänge: "+context->subjectTitle).c_str());CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,18,18,604,210,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Datei hinzufügen",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,125,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ADD),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Öffnen",WS_CHILD|WS_VISIBLE,153,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_OPEN),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Archivieren",WS_CHILD|WS_VISIBLE,253,248,100,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ARCHIVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,532,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_CLOSE),nullptr,nullptr);RefreshAttachmentList(hwnd,context);return 0;}
-    case WM_COMMAND:{const int command=LOWORD(wParam);if(command==IDC_ATTACHMENT_CLOSE){DestroyWindow(hwnd);return 0;}if(command==IDC_ATTACHMENT_ADD){AddAttachmentFromDialog(hwnd,context);return 0;}const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_ATTACHMENT_LIST),LB_GETCURSEL,0,0));if((command==IDC_ATTACHMENT_OPEN||command==IDC_ATTACHMENT_ARCHIVE)&&(selected<0||!context||static_cast<size_t>(selected)>=context->entries.size())){MessageBoxW(hwnd,L"Bitte zuerst einen Anhang auswählen.",L"Anhänge",MB_ICONINFORMATION);return 0;}if(command==IDC_ATTACHMENT_OPEN){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(!std::filesystem::exists(item.storedPath)){if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0||g_SyncService.downloadAttachment(item.sha256,item.storedPath)!=0){MessageBoxW(hwnd,L"Die Datei ist lokal nicht vorhanden und konnte nicht aus der Zentrale geladen werden.",L"Anhänge",MB_ICONERROR);return 0;}}std::wstring localHash;if(!AttachmentSha256(item.storedPath,localHash)||localHash!=item.sha256){MessageBoxW(hwnd,L"Die Integritätsprüfung des Anhangs ist fehlgeschlagen.",L"Anhänge",MB_ICONERROR);return 0;}if(reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd,L"open",item.storedPath.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(hwnd,L"Die Datei konnte nicht geöffnet werden.",L"Anhänge",MB_ICONERROR);return 0;}if(command==IDC_ATTACHMENT_ARCHIVE){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(MessageBoxW(hwnd,L"Metadaten archivieren? Die Datei bleibt aus Revisionsgründen im Arbeitsbereich erhalten.",L"Anhang archivieren",MB_ICONQUESTION|MB_YESNO)!=IDYES)return 0;if(!g_Database->archiveAttachment(item.id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Anhänge",MB_ICONERROR);return 0;}EnterpriseAttachment archived=item;archived.active=false;PublishAttachmentChange(archived,"attachment.archived");RefreshAttachmentList(hwnd,context);return 0;}break;}
+    case WM_CREATE:{context=reinterpret_cast<AttachmentManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));SetWindowTextW(hwnd,(L"Anhänge: "+context->subjectTitle).c_str());CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,18,18,604,210,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Datei hinzufügen",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,125,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ADD),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Öffnen",WS_CHILD|WS_VISIBLE,153,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_OPEN),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Archivieren",WS_CHILD|WS_VISIBLE,253,248,100,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_ARCHIVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Synchronisieren",WS_CHILD|WS_VISIBLE,363,248,145,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_RETRY),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,532,248,90,30,hwnd,reinterpret_cast<HMENU>(IDC_ATTACHMENT_CLOSE),nullptr,nullptr);RefreshAttachmentList(hwnd,context);return 0;}
+    case WM_COMMAND:{const int command=LOWORD(wParam);if(command==IDC_ATTACHMENT_CLOSE){DestroyWindow(hwnd);return 0;}if(command==IDC_ATTACHMENT_ADD){AddAttachmentFromDialog(hwnd,context);return 0;}const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_ATTACHMENT_LIST),LB_GETCURSEL,0,0));if((command==IDC_ATTACHMENT_OPEN||command==IDC_ATTACHMENT_ARCHIVE||command==IDC_ATTACHMENT_RETRY)&&(selected<0||!context||static_cast<size_t>(selected)>=context->entries.size())){MessageBoxW(hwnd,L"Bitte zuerst einen Anhang auswählen.",L"Anhänge",MB_ICONINFORMATION);return 0;}if(command==IDC_ATTACHMENT_RETRY){
+        const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];
+        if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0){MessageBoxW(hwnd,L"Bitte zuerst eine Serververbindung konfigurieren.",L"Anhang-Synchronisation",MB_ICONINFORMATION);return 0;}
+        std::error_code error;const auto size=std::filesystem::file_size(item.storedPath,error);std::wstring digest;
+        if(error||size!=static_cast<uintmax_t>(item.sizeBytes)||!AttachmentSha256(item.storedPath,digest)||digest!=item.sha256){MessageBoxW(hwnd,L"Die lokale Datei fehlt oder stimmt nicht mit dem gespeicherten Anhang überein.",L"Anhang-Synchronisation",MB_ICONERROR);return 0;}
+        if(!PublishAttachmentChange(item,"attachment.created"))MessageBoxW(hwnd,L"Die Übertragung wurde nicht bestätigt. Bitte Verbindung und Synchronisationswarteschlange prüfen.",L"Anhang-Synchronisation",MB_ICONWARNING);
+        else MessageBoxW(hwnd,L"Die Übertragung wurde bestätigt. Ein zentral bereits archivierter Anhang bleibt archiviert.",L"Anhang-Synchronisation",MB_ICONINFORMATION);
+        return 0;
+    }if(command==IDC_ATTACHMENT_OPEN){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(!std::filesystem::exists(item.storedPath)){if(GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)==0||g_SyncService.downloadAttachment(item.sha256,item.storedPath)!=0){MessageBoxW(hwnd,L"Die Datei ist lokal nicht vorhanden und konnte nicht aus der Zentrale geladen werden.",L"Anhänge",MB_ICONERROR);return 0;}}std::wstring localHash;if(!AttachmentSha256(item.storedPath,localHash)||localHash!=item.sha256){MessageBoxW(hwnd,L"Die Integritätsprüfung des Anhangs ist fehlgeschlagen.",L"Anhänge",MB_ICONERROR);return 0;}if(reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd,L"open",item.storedPath.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(hwnd,L"Die Datei konnte nicht geöffnet werden.",L"Anhänge",MB_ICONERROR);return 0;}if(command==IDC_ATTACHMENT_ARCHIVE){const EnterpriseAttachment& item=context->entries[static_cast<size_t>(selected)];if(MessageBoxW(hwnd,L"Metadaten archivieren? Die Datei bleibt aus Revisionsgründen im Arbeitsbereich erhalten.",L"Anhang archivieren",MB_ICONQUESTION|MB_YESNO)!=IDYES)return 0;if(!g_Database->archiveAttachment(item.id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Anhänge",MB_ICONERROR);return 0;}EnterpriseAttachment archived=item;archived.active=false;if(!PublishAttachmentChange(archived,"attachment.archived") && GetEnvironmentVariableW(L"AURA_SYNC_URL",nullptr,0)>0)MessageBoxW(hwnd,L"Der Anhang wurde lokal archiviert. Die zentrale Übertragung wurde nicht bestätigt. Bitte Verbindung und Synchronisationswarteschlange prüfen.",L"Anhang-Synchronisation",MB_ICONWARNING);RefreshAttachmentList(hwnd,context);return 0;}break;}
     case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,message,wParam,lParam);
 }
 void ShowAttachmentManager(HWND owner,const std::wstring& subjectType,int64_t subjectId,const std::wstring& subjectTitle){auto* context=new AttachmentManagerContext{owner,subjectType,subjectId,subjectTitle};EnableWindow(owner,FALSE);if(!CreateWindowExW(WS_EX_DLGMODALFRAME,L"AuraAttachmentManager",L"Anhänge",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,660,330,owner,nullptr,GetModuleHandleW(nullptr),context)){EnableWindow(owner,TRUE);delete context;}}
@@ -1358,7 +1768,7 @@ LRESULT CALLBACK LeaveEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_LEAVE_CANCEL) { DestroyWindow(hwnd); return 0; }
-        if (LOWORD(wParam) == IDC_LEAVE_SAVE && context && g_Database) { int64_t start=0,end=0; if (!ParseBookingDateTime(ControlText(hwnd,IDC_LEAVE_START),start) || !ParseBookingDateTime(ControlText(hwnd,IDC_LEAVE_END),end) || end<=start) { MessageBoxW(hwnd,L"Bitte einen gültigen Zeitraum im Format JJJJ-MM-TT SS:MM angeben.",L"Urlaubsantrag",MB_ICONERROR);return 0; } int64_t id=0; EnterpriseLeaveRequest leave{0,g_CurrentEmployeeId,start,end,ControlText(hwnd,IDC_LEAVE_REASON),L"pending",0,true};if(!g_Database->createLeaveRequest(leave,id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Urlaubsantrag",MB_ICONERROR);return 0;}leave.id=id;PublishLeaveChange(leave,"leave.requested");MessageBoxW(hwnd,L"Der Urlaubsantrag wurde eingereicht.",L"HR-Workflow",MB_ICONINFORMATION);DestroyWindow(hwnd);return 0; }
+        if (LOWORD(wParam) == IDC_LEAVE_SAVE && context && g_Database) { int64_t start=0,end=0; if (!ParseBookingDateTime(ControlText(hwnd,IDC_LEAVE_START),start) || !ParseBookingDateTime(ControlText(hwnd,IDC_LEAVE_END),end) || end<=start) { MessageBoxW(hwnd,L"Bitte einen gültigen Zeitraum im Format JJJJ-MM-TT SS:MM angeben.",L"Urlaubsantrag",MB_ICONERROR);return 0; } int64_t id=0; EnterpriseLeaveRequest leave{0,g_CurrentEmployeeId,start,end,ControlText(hwnd,IDC_LEAVE_REASON),L"pending",0,true};if(!g_Database->createLeaveRequest(leave,id,L"Ralf Krümmel")){MessageBoxW(hwnd,g_Database->error().c_str(),L"Urlaubsantrag",MB_ICONERROR);return 0;}leave.id=id;const bool transmitted=PublishLeaveChange(leave,"leave.requested");if(!transmitted)MessageBoxW(hwnd,L"Der Antrag wurde lokal gespeichert, konnte aber nicht sofort zentral bestätigt werden. Bitte Synchronisationsdienst, Server und Mitarbeiterzuordnung prüfen; bei einem Übertragungsfehler kann ein Eintrag in der Warteschlange liegen.",L"Urlaubssynchronisation",MB_ICONWARNING);MessageBoxW(hwnd,L"Der Urlaubsantrag wurde eingereicht.",L"HR-Workflow",MB_ICONINFORMATION);DestroyWindow(hwnd);return 0; }
         break;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_DESTROY: if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);} delete context; return 0;
@@ -1369,7 +1779,7 @@ void ShowLeaveEditor(HWND owner){auto* context=new LeaveEditorContext{owner};Ena
 
 struct LeaveManagerContext { HWND owner; std::vector<EnterpriseLeaveRequest> requests; };
 void RefreshLeaveList(HWND hwnd,LeaveManagerContext* context){if(!context||!g_Database)return;context->requests=g_Database->leaveRequests(0);HWND list=GetDlgItem(hwnd,IDC_LEAVE_LIST);SendMessageW(list,LB_RESETCONTENT,0,0);for(const EnterpriseLeaveRequest& request:context->requests){std::wstring employee=L"Unbekannt";for(const EnterpriseEmployee& item:g_Database->employees())if(item.id==request.employeeId){employee=item.name;break;}const std::wstring status=request.status==L"pending"?L"Offen":request.status==L"approved"?L"Genehmigt":L"Abgelehnt";const std::wstring row=employee+L" | "+FormatBookingDateTime(request.startsAt)+L" bis "+FormatBookingDateTime(request.endsAt)+L" | "+status+L" | "+request.reason;SendMessageW(list,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(row.c_str()));}}
-LRESULT CALLBACK LeaveManagerProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam){auto* context=reinterpret_cast<LeaveManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(msg){case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;case WM_CREATE:CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,22,22,610,190,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Genehmigen",WS_CHILD|WS_VISIBLE,302,228,100,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_APPROVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Ablehnen",WS_CHILD|WS_VISIBLE,412,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_REJECT),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,542,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_CLOSE),nullptr,nullptr);context=reinterpret_cast<LeaveManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));RefreshLeaveList(hwnd,context);return 0;case WM_COMMAND:if(LOWORD(wParam)==IDC_LEAVE_CLOSE){DestroyWindow(hwnd);return 0;}if(LOWORD(wParam)==IDC_LEAVE_APPROVE||LOWORD(wParam)==IDC_LEAVE_REJECT){const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_LEAVE_LIST),LB_GETCURSEL,0,0));if(!context||selected<0||static_cast<size_t>(selected)>=context->requests.size()){MessageBoxW(hwnd,L"Bitte zuerst einen Antrag auswählen.",L"Urlaubsfreigabe",MB_ICONINFORMATION);return 0;}const EnterpriseLeaveRequest& request=context->requests[static_cast<size_t>(selected)];if(!g_Database->decideLeaveRequest(request.id,LOWORD(wParam)==IDC_LEAVE_APPROVE,g_CurrentEmployeeId,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Urlaubsfreigabe",MB_ICONERROR);else for(const EnterpriseLeaveRequest& leave:g_Database->leaveRequests(0,true))if(leave.id==request.id){PublishLeaveChange(leave,"leave.decided");break;}RefreshLeaveList(hwnd,context);return 0;}break;case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,msg,wParam,lParam);}
+LRESULT CALLBACK LeaveManagerProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam){auto* context=reinterpret_cast<LeaveManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(msg){case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;case WM_CREATE:CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,22,22,610,190,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Genehmigen",WS_CHILD|WS_VISIBLE,302,228,100,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_APPROVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Ablehnen",WS_CHILD|WS_VISIBLE,412,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_REJECT),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,542,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_LEAVE_CLOSE),nullptr,nullptr);context=reinterpret_cast<LeaveManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));RefreshLeaveList(hwnd,context);return 0;case WM_COMMAND:if(LOWORD(wParam)==IDC_LEAVE_CLOSE){DestroyWindow(hwnd);return 0;}if(LOWORD(wParam)==IDC_LEAVE_APPROVE||LOWORD(wParam)==IDC_LEAVE_REJECT){if(!RequireLeaveApprovalPermission(hwnd))return 0;const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_LEAVE_LIST),LB_GETCURSEL,0,0));if(!context||selected<0||static_cast<size_t>(selected)>=context->requests.size()){MessageBoxW(hwnd,L"Bitte zuerst einen Antrag auswählen.",L"Urlaubsfreigabe",MB_ICONINFORMATION);return 0;}const EnterpriseLeaveRequest& request=context->requests[static_cast<size_t>(selected)];if(!g_Database->decideLeaveRequest(request.id,LOWORD(wParam)==IDC_LEAVE_APPROVE,g_CurrentEmployeeId,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Urlaubsfreigabe",MB_ICONERROR);else for(const EnterpriseLeaveRequest& leave:g_Database->leaveRequests(0,true))if(leave.id==request.id){if(!PublishLeaveChange(leave,"leave.decided"))MessageBoxW(hwnd,L"Die Entscheidung wurde lokal gespeichert, konnte aber nicht sofort zentral bestätigt werden. Bitte Synchronisationsdienst, Server und Mitarbeiterzuordnung prüfen; bei einem Übertragungsfehler kann ein Eintrag in der Warteschlange liegen.",L"Urlaubssynchronisation",MB_ICONWARNING);break;}RefreshLeaveList(hwnd,context);return 0;}break;case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,msg,wParam,lParam);}
 void ShowLeaveManager(HWND owner){auto* context=new LeaveManagerContext{owner};EnableWindow(owner,FALSE);if(!CreateWindowExW(WS_EX_DLGMODALFRAME,L"AuraLeaveManager",L"Urlaubsfreigaben",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,670,315,owner,nullptr,GetModuleHandleW(nullptr),context)){EnableWindow(owner,TRUE);delete context;}}
 
 struct ApprovalManagerContext { HWND owner; std::vector<EnterpriseTaskApproval> approvals; };
@@ -1387,7 +1797,7 @@ void ShowMaintenanceEditor(HWND owner,const EnterpriseFacilityAsset& asset,const
 
 struct MaintenanceManagerContext { HWND owner; EnterpriseFacilityAsset asset; std::vector<EnterpriseMaintenanceOrder> orders; };
 void RefreshMaintenanceList(HWND hwnd,MaintenanceManagerContext* context){if(!context||!g_Database)return;context->orders=g_Database->maintenanceOrders(context->asset.id);HWND list=GetDlgItem(hwnd,IDC_MAINT_LIST);SendMessageW(list,LB_RESETCONTENT,0,0);for(const EnterpriseMaintenanceOrder& order:context->orders){const std::wstring status=order.status==L"in_progress"?L"In Bearbeitung":order.status==L"completed"?L"Abgeschlossen":order.status==L"cancelled"?L"Storniert":L"Offen";const std::wstring row=status+L" | "+order.title+(order.dueAt>0?L" | fällig "+FormatBookingDateTime(order.dueAt):L"")+ (order.recurrenceDays>0?L" | alle "+std::to_wstring(order.recurrenceDays)+L" Tage":L"");SendMessageW(list,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(row.c_str()));}}
-LRESULT CALLBACK MaintenanceManagerProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam){auto* context=reinterpret_cast<MaintenanceManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(msg){case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;case WM_CREATE:{context=reinterpret_cast<MaintenanceManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));const std::wstring title=L"Wartung: "+context->asset.name;SetWindowTextW(hwnd,title.c_str());CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,22,22,650,190,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Neu",WS_CHILD|WS_VISIBLE,22,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_NEW),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Bearbeiten",WS_CHILD|WS_VISIBLE,112,228,95,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_EDIT),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Status",WS_CHILD|WS_VISIBLE,217,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_ADVANCE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Archiv",WS_CHILD|WS_VISIBLE,307,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_ARCHIVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,582,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_CLOSE),nullptr,nullptr);RefreshMaintenanceList(hwnd,context);return 0;}case WM_ACTIVATE:if(LOWORD(wParam)!=WA_INACTIVE)RefreshMaintenanceList(hwnd,context);return 0;case WM_COMMAND:if(LOWORD(wParam)==IDC_MAINT_CLOSE){DestroyWindow(hwnd);return 0;}if(LOWORD(wParam)==IDC_MAINT_NEW){ShowMaintenanceEditor(hwnd,context->asset);return 0;}if(LOWORD(wParam)==IDC_MAINT_EDIT||LOWORD(wParam)==IDC_MAINT_ADVANCE||LOWORD(wParam)==IDC_MAINT_ARCHIVE||(LOWORD(wParam)==IDC_MAINT_LIST&&HIWORD(wParam)==LBN_DBLCLK)){const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_MAINT_LIST),LB_GETCURSEL,0,0));if(!context||selected<0||static_cast<size_t>(selected)>=context->orders.size()){MessageBoxW(hwnd,L"Bitte zuerst einen Wartungsauftrag auswählen.",L"Wartung",MB_ICONINFORMATION);return 0;}const EnterpriseMaintenanceOrder& order=context->orders[static_cast<size_t>(selected)];if(LOWORD(wParam)==IDC_MAINT_ARCHIVE){if(MessageBoxW(hwnd,L"Wartungsauftrag archivieren?",L"Wartung",MB_YESNO|MB_ICONWARNING)==IDYES){if(!g_Database->archiveMaintenanceOrder(order.id,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Wartung",MB_ICONERROR);else{EnterpriseMaintenanceOrder archived=order;archived.active=false;PublishMaintenanceChange(context->asset,archived,"facility.maintenance.archived");}}RefreshMaintenanceList(hwnd,context);return 0;}if(LOWORD(wParam)==IDC_MAINT_ADVANCE){const std::wstring next=order.status==L"open"?L"in_progress":order.status==L"in_progress"?L"completed":order.status==L"completed"?L"open":L"open";if(!g_Database->updateMaintenanceOrderStatus(order.id,next,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Wartung",MB_ICONERROR);else{EnterpriseMaintenanceOrder updated=order;updated.status=next;PublishMaintenanceChange(context->asset,updated,"facility.maintenance.status.changed");}RefreshMaintenanceList(hwnd,context);return 0;}ShowMaintenanceEditor(hwnd,context->asset,&order);return 0;}break;case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,msg,wParam,lParam);}
+LRESULT CALLBACK MaintenanceManagerProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam){auto* context=reinterpret_cast<MaintenanceManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));switch(msg){case WM_NCCREATE:SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));return TRUE;case WM_CREATE:{context=reinterpret_cast<MaintenanceManagerContext*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));const std::wstring title=L"Wartung: "+context->asset.name;SetWindowTextW(hwnd,title.c_str());CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,22,22,650,190,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_LIST),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Neu",WS_CHILD|WS_VISIBLE,22,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_NEW),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Bearbeiten",WS_CHILD|WS_VISIBLE,112,228,95,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_EDIT),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Status",WS_CHILD|WS_VISIBLE,217,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_ADVANCE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Archiv",WS_CHILD|WS_VISIBLE,307,228,80,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_ARCHIVE),nullptr,nullptr);CreateWindowW(L"BUTTON",L"Schließen",WS_CHILD|WS_VISIBLE,582,228,90,30,hwnd,reinterpret_cast<HMENU>(IDC_MAINT_CLOSE),nullptr,nullptr);RefreshMaintenanceList(hwnd,context);return 0;}case WM_ACTIVATE:if(LOWORD(wParam)!=WA_INACTIVE)RefreshMaintenanceList(hwnd,context);return 0;case WM_COMMAND:if(LOWORD(wParam)==IDC_MAINT_CLOSE){DestroyWindow(hwnd);return 0;}if(LOWORD(wParam)==IDC_MAINT_NEW){ShowMaintenanceEditor(hwnd,context->asset);return 0;}if(LOWORD(wParam)==IDC_MAINT_EDIT||LOWORD(wParam)==IDC_MAINT_ADVANCE||LOWORD(wParam)==IDC_MAINT_ARCHIVE||(LOWORD(wParam)==IDC_MAINT_LIST&&HIWORD(wParam)==LBN_DBLCLK)){const int selected=static_cast<int>(SendMessageW(GetDlgItem(hwnd,IDC_MAINT_LIST),LB_GETCURSEL,0,0));if(!context||selected<0||static_cast<size_t>(selected)>=context->orders.size()){MessageBoxW(hwnd,L"Bitte zuerst einen Wartungsauftrag auswählen.",L"Wartung",MB_ICONINFORMATION);return 0;}const EnterpriseMaintenanceOrder& order=context->orders[static_cast<size_t>(selected)];if(LOWORD(wParam)==IDC_MAINT_ARCHIVE){if(MessageBoxW(hwnd,L"Wartungsauftrag archivieren?",L"Wartung",MB_YESNO|MB_ICONWARNING)==IDYES){if(!g_Database->archiveMaintenanceOrder(order.id,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Wartung",MB_ICONERROR);else{EnterpriseMaintenanceOrder archived=order;archived.active=false;PublishMaintenanceChange(context->asset,archived,"facility.maintenance.archived");}}RefreshMaintenanceList(hwnd,context);return 0;}if(LOWORD(wParam)==IDC_MAINT_ADVANCE){const std::wstring next=order.status==L"open"?L"in_progress":order.status==L"in_progress"?L"completed":order.status==L"completed"?L"open":L"open";const auto before=g_Database->maintenanceOrders(context->asset.id,true);if(!g_Database->updateMaintenanceOrderStatus(order.id,next,L"Ralf Krümmel"))MessageBoxW(hwnd,g_Database->error().c_str(),L"Wartung",MB_ICONERROR);else{EnterpriseMaintenanceOrder updated=order;updated.status=next;PublishMaintenanceChange(context->asset,updated,"facility.maintenance.status.changed");for(const auto& item:g_Database->maintenanceOrders(context->asset.id,true)){if(std::none_of(before.begin(),before.end(),[&](const auto& existing){return existing.id==item.id;}))PublishMaintenanceChange(context->asset,item,"facility.maintenance.created");}}RefreshMaintenanceList(hwnd,context);return 0;}ShowMaintenanceEditor(hwnd,context->asset,&order);return 0;}break;case WM_CLOSE:DestroyWindow(hwnd);return 0;case WM_DESTROY:if(context&&context->owner){EnableWindow(context->owner,TRUE);SetForegroundWindow(context->owner);}delete context;return 0;}return DefWindowProcW(hwnd,msg,wParam,lParam);}
 void ShowMaintenanceManager(HWND owner,const EnterpriseFacilityAsset& asset){auto* context=new MaintenanceManagerContext{owner,asset};EnableWindow(owner,FALSE);if(!CreateWindowExW(WS_EX_DLGMODALFRAME,L"AuraMaintenanceManager",L"Wartung",WS_CAPTION|WS_SYSMENU|WS_POPUP|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,710,315,owner,nullptr,GetModuleHandleW(nullptr),context)){EnableWindow(owner,TRUE);delete context;}}
 
 struct AssetManagerContext { HWND owner; std::vector<EnterpriseFacilityAsset> assets; };
@@ -1434,9 +1844,9 @@ LRESULT CALLBACK BookingEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (LOWORD(wParam) == IDC_BOOK_CANCEL) { DestroyWindow(hwnd); return 0; }
         if (LOWORD(wParam) == IDC_BOOK_CANCEL_BOOKING + 100 && context && context->reschedule && g_Database) {
             const std::string cancelPayload = "{\"bookingId\":" + std::to_string(context->existing.id) + "}";
-            if (!g_SyncService.publish("booking.cancelled", cancelPayload)) { MessageBoxW(hwnd, L"Die zentrale Stornierung konnte nicht bestätigt werden. Die lokale Buchung bleibt unverändert.", L"Zentrale Buchungsstornierung", MB_ICONERROR); return 0; }
+            if (!g_SyncService.cancelDesktopBooking(cancelPayload)) { MessageBoxW(hwnd, L"Die Stornierung konnte nicht bestätigt werden. Die lokale Buchung bleibt unverändert. Bitte prüfen Sie den zentralen Kalender und die Verbindung, bevor Sie es erneut versuchen.", L"Zentrale Buchungsstornierung", MB_ICONERROR); return 0; }
             if (!g_Database->cancelBooking(context->existing.id, L"Ralf Krümmel")) {
-                const std::string restorePayload = "{\"bookingId\":" + std::to_string(context->existing.id) + ",\"roomId\":" + std::to_string(context->existing.roomId) + ",\"startsAt\":" + std::to_string(context->existing.startUtc) + ",\"endsAt\":" + std::to_string(context->existing.endUtc) + "}";
+                const std::string restorePayload = "{\"bookingId\":" + std::to_string(context->existing.id) + ",\"roomId\":" + std::to_string(context->existing.roomId) + ",\"roomKey\":" + JsonString(Utf8ToWide(StableSyncObjectId(L"room", context->existing.roomId))) + ",\"startsAt\":" + std::to_string(context->existing.startUtc) + ",\"endsAt\":" + std::to_string(context->existing.endUtc) + "}";
                 g_SyncService.publish("booking.created", restorePayload);
                 MessageBoxW(hwnd, g_Database->error().c_str(), L"Stornierung abgelehnt", MB_ICONERROR); return 0;
             }
@@ -1457,17 +1867,19 @@ LRESULT CALLBACK BookingEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             // A preflight alone leaves a race between two clients.  Hold a
             // short-lived central reservation for every slot until the local
             // SQLite transaction succeeds, then commit the reservation.
+            const std::string roomKey = StableSyncObjectId(L"room", context->room.id);
+            const std::string employeeKey = StableSyncObjectId(L"employee", g_CurrentEmployeeId);
             std::vector<int64_t> reservationIds;
             int32_t centralResult = 0;
             for (int seriesIndex = 0; seriesIndex < occurrences && centralResult == 0; ++seriesIndex) {
                 const int64_t offset = static_cast<int64_t>(seriesIndex) * intervalDays * 86400;
                 const int64_t reservationId = NextCentralReservationId();
-                centralResult = g_SyncService.reserveBooking(reservationId, context->reschedule ? context->existing.id : 0, context->room.id, start + offset, end + offset);
+                centralResult = g_SyncService.reserveBookingWithDetails(reservationId, context->reschedule ? context->existing.id : 0, context->room.id, start + offset, end + offset, roomKey, employeeKey, attendees);
                 if (centralResult == 0) reservationIds.push_back(reservationId);
             }
             if (centralResult != 0) {
                 for (const int64_t reservationId : reservationIds) g_SyncService.releaseBooking(reservationId);
-                const wchar_t* reason = centralResult == 5 ? L"Mindestens ein Serientermin kollidiert mit einer bereits zentral bestätigten Buchung." : L"Die zentrale Buchungsprüfung ist nicht erreichbar oder hat die Anfrage abgelehnt.";
+                const wchar_t* reason = centralResult == 5 ? L"Mindestens ein Serientermin kollidiert mit einer bereits zentral bestätigten Buchung." : L"Die zentrale Buchungsprüfung ist nicht erreichbar oder hat die Anfrage abgelehnt. Bitte Serververbindung und die eindeutige Zuordnung der angemeldeten Person zum Serverkonto prüfen.";
                 MessageBoxW(hwnd, reason, L"Zentrale Buchungsreservierung", MB_ICONERROR);
                 return 0;
             }
@@ -1498,10 +1910,10 @@ LRESULT CALLBACK BookingEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 return 0;
             }
             if (occurrences > 1 && !context->reschedule) {
-                for (int seriesIndex = 0; seriesIndex < occurrences; ++seriesIndex) { const int64_t offset = static_cast<int64_t>(seriesIndex) * intervalDays * 86400; g_SyncService.publish("booking.created", "{\"bookingId\":" + std::to_string(seriesIds[seriesIndex]) + ",\"roomId\":" + std::to_string(context->room.id) + ",\"startsAt\":" + std::to_string(start + offset) + ",\"endsAt\":" + std::to_string(end + offset) + "}"); }
+                for (int seriesIndex = 0; seriesIndex < occurrences; ++seriesIndex) { const int64_t offset = static_cast<int64_t>(seriesIndex) * intervalDays * 86400; g_SyncService.publish("booking.created", "{\"bookingId\":" + std::to_string(seriesIds[seriesIndex]) + ",\"roomId\":" + std::to_string(context->room.id) + ",\"roomKey\":" + JsonString(Utf8ToWide(roomKey)) + ",\"startsAt\":" + std::to_string(start + offset) + ",\"endsAt\":" + std::to_string(end + offset) + "}"); }
             } else {
                 const int64_t eventId = context->reschedule ? context->existing.id : id;
-                g_SyncService.publish(context->reschedule ? "booking.rescheduled" : "booking.created", "{\"bookingId\":" + std::to_string(eventId) + ",\"roomId\":" + std::to_string(context->room.id) + ",\"startsAt\":" + std::to_string(start) + ",\"endsAt\":" + std::to_string(end) + "}");
+                g_SyncService.publish(context->reschedule ? "booking.rescheduled" : "booking.created", "{\"bookingId\":" + std::to_string(eventId) + ",\"roomId\":" + std::to_string(context->room.id) + ",\"roomKey\":" + JsonString(Utf8ToWide(roomKey)) + ",\"startsAt\":" + std::to_string(start) + ",\"endsAt\":" + std::to_string(end) + "}");
             }
             RefreshRoomsFromDatabase(); InvalidateRect(context->owner, nullptr, FALSE); DestroyWindow(hwnd); return 0;
         }
@@ -1510,7 +1922,7 @@ LRESULT CALLBACK BookingEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_DESTROY: if (context && context->owner) { EnableWindow(context->owner, TRUE); SetForegroundWindow(context->owner); } delete context; return 0;
     } return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
-void ShowBookingEditor(HWND owner, const OfficeRoom& room, const EnterpriseBooking* existing = nullptr) { auto* context = new BookingEditorContext{owner, room, existing ? *existing : EnterpriseBooking{}, existing != nullptr}; EnableWindow(owner, FALSE); if (!CreateWindowExW(WS_EX_DLGMODALFRAME, L"AuraBookingEditor", L"Buchung", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 450, existing ? 270 : 330, owner, nullptr, GetModuleHandleW(nullptr), context)) { EnableWindow(owner, TRUE); delete context; } }
+void ShowBookingEditor(HWND owner, const OfficeRoom& room, const EnterpriseBooking* existing = nullptr) { if(existing && existing->userId==0){MessageBoxW(owner,L"Diese zentrale Buchung wird auf ihrem ursprünglichen Arbeitsplatz oder in der zentralen Ansicht bearbeitet.",L"Zentrale Buchung",MB_ICONINFORMATION);return;} auto* context = new BookingEditorContext{owner, room, existing ? *existing : EnterpriseBooking{}, existing != nullptr}; EnableWindow(owner, FALSE); if (!CreateWindowExW(WS_EX_DLGMODALFRAME, L"AuraBookingEditor", L"Buchung", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 450, existing ? 270 : 330, owner, nullptr, GetModuleHandleW(nullptr), context)) { EnableWindow(owner, TRUE); delete context; } }
 
 struct BlockEditorContext { HWND owner; OfficeRoom room; };
 LRESULT CALLBACK BlockEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1762,7 +2174,7 @@ void RenderSidebar(HDC hdc, const RECT& clientRc) {
     SelectObject(hdc, g_Fonts.hSmall);
     SetTextColor(hdc, Theme::ACCENT);
     RECT subBrandRc = { 24, 46, 220, 65 };
-    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.4", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
+    DrawTextW(hdc, L"ENTERPRISE CORE OS \u2022 v2.4.5", -1, &subBrandRc, DT_SINGLELINE | DT_LEFT);
 
     const wchar_t* navLabels[] = {
         L" \u25A3  Dashboard",
@@ -2233,9 +2645,10 @@ void RenderAdministration(HDC hdc, const RECT& mainRc) {
     SetTextColor(hdc,Theme::TEXT_SECONDARY); DrawTextW(hdc,L"Wiederherstellen",-1,&restore,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y += 54;
     RECT info = {x,y,mainRc.right-30,y+54}; DrawRoundedRect(hdc,info,Theme::BG_CARD,Theme::BORDER,8);
-    SelectObject(hdc,g_Fonts.hSmall); SetTextColor(hdc,Theme::TEXT_MUTED); RECT ir={info.left+16,info.top+10,info.right-16,info.bottom-10};
+    SelectObject(hdc,g_Fonts.hSmall); SetTextColor(hdc,Theme::TEXT_MUTED); RECT ir={info.left+16,info.top+10,info.right-205,info.bottom-10};
     const std::wstring serviceState = L"Synchronisation: " + g_SyncService.status() + L"  •  Datenbasis: KR_BUILD\\aura-enterprise.db";
     DrawTextW(hdc,serviceState.c_str(),-1,&ir,DT_SINGLELINE|DT_VCENTER);
+    RECT conflict={info.right-192,info.top+9,info.right-8,info.bottom-9};DrawRoundedRect(hdc,conflict,Theme::BG_DARK,Theme::BORDER,6);SetTextColor(hdc,Theme::TEXT_SECONDARY);DrawTextW(hdc,L"Anhangskonflikt prüfen",-1,&conflict,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     y += 74; SelectObject(hdc,g_Fonts.hSection); SetTextColor(hdc,Theme::TEXT_WHITE); RECT auditTitle={x,y,x+300,y+22}; DrawTextW(hdc,L"Audit-Protokoll",-1,&auditTitle,DT_SINGLELINE); y+=32;
     const std::vector<std::wstring> audit = g_Database ? g_Database->auditLog(12) : std::vector<std::wstring>{};
     for (const std::wstring& entry : audit) { RECT row={x,y,mainRc.right-30,y+32}; DrawRoundedRect(hdc,row,Theme::BG_CARD,Theme::BORDER,6); SelectObject(hdc,g_Fonts.hSmall); SetTextColor(hdc,Theme::TEXT_SECONDARY); RECT text={row.left+12,row.top,row.right-12,row.bottom}; DrawTextW(hdc,entry.c_str(),-1,&text,DT_SINGLELINE|DT_VCENTER); y+=38; }
@@ -2406,9 +2819,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     const bool nextDone = !g_State.tasks[i].done;
                     if (!RequireWorkflowTransition(hwnd, "task", g_State.tasks[i].done ? "done" : "open", nextDone ? "done" : "open")) return 0;
                     g_State.tasks[i].done = nextDone;
-                    if (g_Database && !g_Database->updateTaskStatus(g_State.tasks[i].id, nextDone ? L"done" : L"open", L"Ralf Krümmel"))
+                    int64_t repeatedTaskId=0;
+                    if (g_Database && !g_Database->updateTaskStatus(g_State.tasks[i].id, nextDone ? L"done" : L"open", L"Ralf Krümmel", &repeatedTaskId))
                         MessageBoxW(hwnd, g_Database->error().c_str(), L"Aufgabe konnte nicht geändert werden", MB_ICONERROR);
-                    else if(g_Database) for(const EnterpriseTask& task:g_Database->tasks())if(task.id==g_State.tasks[i].id){PublishTaskChange(task,"task.status.changed");break;}
+                    else if(g_Database) {
+                        const auto tasks=g_Database->tasks();
+                        for(const EnterpriseTask& task:tasks)if(task.id==g_State.tasks[i].id){PublishTaskChange(task,"task.status.changed");break;}
+                        if(repeatedTaskId>0)for(const EnterpriseTask& task:tasks)if(task.id==repeatedTaskId){PublishTaskChange(task,"task.created");break;}
+                    }
                     RefreshTasksFromDatabase();
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -2533,7 +2951,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (g_State.activeTab == NavTab::TEAM) {
             const int createTop = 70 + 22;
-            if (mouseX >= clientRc.right - 470 && mouseX <= clientRc.right - 340 && mouseY >= createTop && mouseY <= createTop + 34) { if(!RequireEnterprisePermission(hwnd,L"employees.manage"))return 0; ShowLeaveManager(hwnd); return 0; }
+            if (mouseX >= clientRc.right - 470 && mouseX <= clientRc.right - 340 && mouseY >= createTop && mouseY <= createTop + 34) { if(!RequireLeaveApprovalPermission(hwnd))return 0; ShowLeaveManager(hwnd); return 0; }
             if (mouseX >= clientRc.right - 330 && mouseX <= clientRc.right - 200 && mouseY >= createTop && mouseY <= createTop + 34) { if(!RequireEnterprisePermission(hwnd,L"employees.manage"))return 0; ShowOrganizationManager(hwnd); return 0; }
             if (mouseX >= clientRc.right - 190 && mouseX <= clientRc.right - 30 && mouseY >= createTop && mouseY <= createTop + 34) { if(!RequireEnterprisePermission(hwnd,L"employees.manage"))return 0; ShowEmployeeEditor(hwnd); return 0; }
             int y = 70 + 24 + 48;
@@ -2563,6 +2981,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (g_State.activeTab == NavTab::ADMIN) {
             const int top = 70 + 22;
+            if(mouseX>=clientRc.right-222&&mouseX<=clientRc.right-38&&mouseY>=157&&mouseY<=193){if(!RequireEnterprisePermission(hwnd,L"admin.manage"))return 0;ShowAttachmentArchiveConflict(hwnd);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
             if (mouseX >= clientRc.right - 530 && mouseX <= clientRc.right - 410 && mouseY >= top && mouseY <= top + 34) { if(!RequireEnterprisePermission(hwnd,L"admin.manage"))return 0; ShowAccountManager(hwnd); return 0; }
             if (mouseX >= clientRc.right - 400 && mouseX <= clientRc.right - 280 && mouseY >= top && mouseY <= top + 34) { if(!RequireEnterprisePermission(hwnd,L"admin.manage"))return 0; ShowRoleManager(hwnd); return 0; }
             if (mouseX >= clientRc.right - 270 && mouseX <= clientRc.right - 150 && mouseY >= top && mouseY <= top + 34) {
